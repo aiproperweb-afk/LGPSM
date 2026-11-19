@@ -1,0 +1,107 @@
+import { Request, Response } from 'express';
+import { categoryService } from '../services/category.service';
+
+export const categoryController = {
+  async createCategory(req: Request, res: Response) {
+    try {
+      const category = await categoryService.createCategory(req.body);
+      return res.status(201).json({ success: true, data: category });
+    } catch (error: any) {
+      if (error?.statusCode) return res.status(error.statusCode).json({ success: false, message: error.message });
+      return res.status(400).json({ success: false, error: 'Bad Request', message: error.message });
+    }
+  },
+
+  async createCustomCategory(req: Request, res: Response) {
+    try {
+      return res.status(201).json({ success: true, data: await categoryService.createCustomCategory(req.user!.userId, req.body.name) });
+    } catch (error: any) {
+      if (error?.statusCode) return res.status(error.statusCode).json({ success: false, message: error.message });
+      return res.status(400).json({ success: false, message: error.message });
+    }
+  },
+
+  async addCustomSubcategory(req: Request, res: Response) {
+    try {
+      return res.status(201).json({ success: true, data: await categoryService.addCustomSubcategory(req.user!.userId, req.params.id as string, req.body.name) });
+    } catch (error: any) {
+      if (error?.statusCode) return res.status(error.statusCode).json({ success: false, message: error.message });
+      if (error.message === 'CATEGORY_NOT_FOUND') return res.status(404).json({ success: false, message: 'Category not found' });
+      return res.status(400).json({ success: false, message: error.message });
+    }
+  },
+
+  async deleteCustomCategory(req: Request, res: Response) {
+    try {
+      return res.status(200).json({ success: true, data: await categoryService.deleteCustomCategory(req.user!.userId, req.params.id as string) });
+    } catch (error: any) {
+      if (error.message === 'CATEGORY_NOT_FOUND') return res.status(404).json({ success: false, message: 'Category not found' });
+      console.error('Request failed:', error?.message);
+      return res.status(500).json({ success: false, message: 'Something went wrong. Please try again.' });
+    }
+  },
+
+  async deleteCustomSubcategory(req: Request, res: Response) {
+    try {
+      return res.status(200).json({ success: true, data: await categoryService.deleteCustomSubcategory(req.user!.userId, req.params.id as string, req.params.subId as string) });
+    } catch (error: any) {
+      if (error.message === 'CATEGORY_NOT_FOUND') return res.status(404).json({ success: false, message: 'Subcategory not found' });
+      console.error('Request failed:', error?.message);
+      return res.status(500).json({ success: false, message: 'Something went wrong. Please try again.' });
+    }
+  },
+
+  async addSubcategory(req: Request, res: Response) {
+    try {
+      const category = await categoryService.addSubcategory(req.params.id as string, req.body.name);
+      return res.status(201).json({ success: true, data: category });
+    } catch (error: any) {
+      if (error?.statusCode) return res.status(error.statusCode).json({ success: false, message: error.message });
+      if (error.message === 'CATEGORY_NOT_FOUND') return res.status(404).json({ success: false, message: 'Category not found' });
+      return res.status(400).json({ success: false, message: error.message });
+    }
+  },
+
+  async getCategories(req: Request, res: Response) {
+    try {
+      const activeOnly = req.query.activeOnly !== 'false';
+      const categories = await categoryService.getCategories(activeOnly, req.user?.userId);
+      return res.status(200).json({ success: true, data: categories });
+    } catch (error: any) {
+      console.error('Request failed:', error?.message);
+      return res.status(500).json({ error: 'Internal Server Error', message: 'Something went wrong. Please try again.' });
+    }
+  },
+
+  async getCategoryById(req: Request, res: Response) {
+    try {
+      const category = await categoryService.getCategoryById(req.params.id as string, req.user?.userId);
+      return res.status(200).json({ success: true, data: category });
+    } catch (error: any) {
+      if (error.message === 'CATEGORY_NOT_FOUND') return res.status(404).json({ error: 'Not Found', message: 'Category not found' });
+      console.error('Request failed:', error?.message);
+      return res.status(500).json({ error: 'Internal Server Error', message: 'Something went wrong. Please try again.' });
+    }
+  },
+
+  async updateCategory(req: Request, res: Response) {
+    try {
+      const category = await categoryService.updateCategory(req.params.id as string, req.body);
+      return res.status(200).json({ success: true, data: category });
+    } catch (error: any) {
+      if (error.message === 'CATEGORY_NOT_FOUND') return res.status(404).json({ error: 'Not Found', message: 'Category not found' });
+      return res.status(400).json({ error: 'Bad Request', message: error.message });
+    }
+  },
+
+  async deleteCategory(req: Request, res: Response) {
+    try {
+      const category = await categoryService.deleteCategory(req.params.id as string);
+      return res.status(200).json({ success: true, message: 'Category deactivated successfully', data: category });
+    } catch (error: any) {
+      if (error.message === 'CATEGORY_NOT_FOUND') return res.status(404).json({ error: 'Not Found', message: 'Category not found' });
+      console.error('Request failed:', error?.message);
+      return res.status(500).json({ error: 'Internal Server Error', message: 'Something went wrong. Please try again.' });
+    }
+  }
+};

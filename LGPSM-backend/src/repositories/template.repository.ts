@@ -1,0 +1,84 @@
+import mongoose from 'mongoose';
+import { Template, ITemplate } from '../models/Template';
+import { User, Role } from '../models/User';
+import { masterCardOnly } from '../constants/masterCard';
+
+/**
+ * Who is asking, for visibility. Admins see every template (drafts included); an organizer sees the published
+ * templates that have no owner (the designers' and admin-published ones) plus their own, whatever their state.
+ */
+export interface TemplateViewer {
+  userId?: string;
+  isAdmin: boolean;
+}
+
+export interface TemplateListOptions {
+  skip?: number;
+  limit?: number;
+  /** only the viewer's own templates, drafts included (the "My templates" list) */
+  mineOnly?: boolean;
+  kind?: 'INVITATION' | 'POSTER';
+}
+
+// A template only needs its category's name. The subcategory list is left out: it can hold other organizers' private subcategories.
+const CATEGORY_FIELDS = 'name description isActive';
+
+function listQuery(categoryId: string | undefined, viewer: TemplateViewer, options: TemplateListOptions, adminIds?: mongoose.Types.ObjectId[]) {
+  const query: any = { isActive: true };
+  const own = viewer.userId && mongoose.Types.ObjectId.isValid(viewer.userId) ? { ownerId: new mongoose.Types.ObjectId(viewer.userId) } : null;
+  // while the master card is the only shared design, it is the only shared template listed; a person's own uploaded templates still are
+  if (masterCardOnly()) query.$and = [{ $or: [{ cardDesign: 'MASTER' }, ...(own ? [{ cardDesign: 'CUSTOM', ...own }] : [])] }];
+  if (categoryId) query.categoryId = categoryId;
+  if (options.kind) query.kind = options.kind === 'INVITATION' ? { $in: ['INVITATION', null] } : 'POSTER';
+  if (options.mineOnly) {
+    query.ownerId = own?.ownerId ?? { $exists: false, $eq: null };
+    return query;
+  }
+  if (viewer.isAdmin && adminIds) {
+    // an organizer's private upload is theirs alone: an admin sees the shared (system / ownerless) templates and admins' own
+    query.$or = [{ ownerId: { $exists: false } }, { ownerId: null }, { isSystemTemplate: true }, { ownerId: { $in: adminIds } }];
+  }
+  if (!viewer.isAdmin) {
+    // Templates created before the publish flag existed count as published. A template with an owner is a private
+    // AI design unless an admin published it as a system template, so another organizer's never appears.
+    const visible: any[] = [{ ownerId: { $exists: false }, isPublished: { $ne: false } }, { isSystemTemplate: true, isPublished: true }];
+    // the owner's published templates are offered for their events; drafts live in the "mine" list until published
+    if (own) visible.push({ ...own, isPublished: true });
+    query.$or = visible;
+  }
+  return query;
+}
+
+async function adminIdsFor(viewer: TemplateViewer, options: TemplateListOptions) {
+  if (!viewer.isAdmin || options.mineOnly) return undefined;
+  return (await User.find({ role: Role.ADMIN }).select('_id').lean()).map((u) => u._id as mongoose.Types.ObjectId);
+}
+
+export const templateRepository = {
+  async create(data: Partial<ITemplate>): Promise<ITemplate> {
+    return await Template.create(data);
+  },
+
+  async findAll(categoryId: string | undefined, viewer: TemplateViewer, options: TemplateListOptions = {}): Promise<ITemplate[]> {
+    let cursor = Template.find(listQuery(categoryId, viewer, options, await adminIdsFor(viewer, options))).populate('categoryId', CATEGORY_FIELDS).sort({ createdAt: -1, _id: -1 });
+    if (options.skip) cursor = cursor.skip(options.skip);
+    if (options.limit) cursor = cursor.limit(options.limit);
+    return await cursor;
+  },
+
+  async count(categoryId: string | undefined, viewer: TemplateViewer, options: TemplateListOptions = {}): Promise<number> {
+    return await Template.countDocuments(listQuery(categoryId, viewer, options, await adminIdsFor(viewer, options)));
+  },
+
+  async findById(id: string): Promise<ITemplate | null> {
+    return await Template.findById(id).populate('categoryId', CATEGORY_FIELDS);
+  },
+
+  async update(id: string, updateData: Partial<ITemplate>): Promise<ITemplate | null> {
+    return await Template.findByIdAndUpdate(id, updateData, { new: true });
+  },
+
+  async delete(id: string): Promise<ITemplate | null> {
+    return await Template.findByIdAndUpdate(id, { isActive: false }, { new: true });
+  }
+};

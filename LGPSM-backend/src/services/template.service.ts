@@ -1,0 +1,110 @@
+import mongoose from 'mongoose';
+import { alertService } from './alert.service';
+import { templateRepository, TemplateViewer } from '../repositories/template.repository';
+import { ITemplate, Template } from '../models/Template';
+import { masterCardOnly } from '../constants/masterCard';
+import { ensureMasterTemplate } from './cardTemplates/defaultTemplates';
+
+/** Can this viewer see/use this template? Mirrors the list rules in template.repository.ts. */
+export function templateVisibleTo(template: Pick<ITemplate, 'ownerId' | 'isPublished' | 'isSystemTemplate' | 'isActive'>, viewer: TemplateViewer): boolean {
+  if (template.isActive === false && !viewer.isAdmin) return false;
+  if (viewer.isAdmin) return true;
+  if (template.ownerId) return String(template.ownerId) === viewer.userId || (template.isSystemTemplate && template.isPublished === true);
+  return template.isPublished !== false;
+}
+
+/** A published template everyone can use (an administrator's, not an organizer's private design) is announced to the organizers */
+export async function announceTemplate(t: Pick<ITemplate, 'name' | 'isPublished' | 'isSystemTemplate' | '_id'> & { ownerId?: unknown }) {
+  if (t.isPublished === false) return;
+  await alertService.notifyAllOrganizers({ type: 'TEMPLATE', title: 'New invitation template', message: `The template "${t.name}" is now available. Choose it when you create an event.`, entityType: 'Template', entityId: t._id });
+}
+
+export const templateService = {
+  async createTemplate(data: Partial<ITemplate>): Promise<ITemplate> {
+    const created = await templateRepository.create(data);
+    await announceTemplate(created);
+    return created;
+  },
+
+  async getTemplates(
+    categoryId: string | undefined,
+    viewer: TemplateViewer,
+    options: { page?: number; limit?: number; mineOnly?: boolean; kind?: 'INVITATION' | 'POSTER' } = {}
+  ) {
+    const page = Math.max(options.page || 1, 1);
+    const limit = Math.min(Math.max(options.limit || 25, 1), 100);
+    const skip = (page - 1) * limit;
+    const listOptions = { skip, limit, mineOnly: options.mineOnly, kind: options.kind };
+    // (the master card is installed the first time it is needed, so no manual step stands between the code and the list)
+    if (masterCardOnly()) await ensureMasterTemplate();
+
+    const [templates, total] = await Promise.all([
+      templateRepository.findAll(categoryId, viewer, listOptions),
+      templateRepository.count(categoryId, viewer, listOptions),
+    ]);
+
+    return { templates, total, page, limit, totalPages: Math.ceil(total / limit) || 1 };
+  },
+
+  /** A template the viewer may see; anything else is reported as missing so another tenant's ids reveal nothing. */
+  async getTemplateById(id: string, viewer?: TemplateViewer): Promise<ITemplate> {
+    const template = await templateRepository.findById(id);
+    if (!template || (viewer && !templateVisibleTo(template, viewer))) throw new Error('TEMPLATE_NOT_FOUND');
+    return template;
+  },
+
+  async updateTemplate(id: string, updateData: Partial<ITemplate>): Promise<ITemplate> {
+    const before: any = updateData.isPublished === true ? await Template.findById(id).select('isPublished').lean() : null;
+    const template = await templateRepository.update(id, updateData);
+    if (!template) throw new Error('TEMPLATE_NOT_FOUND');
+    // a template that has just been published (it was a draft) is announced
+    if (before && before.isPublished === false) await announceTemplate(template);
+    return template;
+  },
+
+  /** An organizer changing their own AI template: only fields they may edit, only on a template they own. */
+  async updateOwnTemplate(id: string, userId: string, updateData: Partial<ITemplate>): Promise<ITemplate> {
+    if (!mongoose.Types.ObjectId.isValid(id)) throw new Error('TEMPLATE_NOT_FOUND');
+    const template = await Template.findOneAndUpdate({ _id: id, ownerId: userId, isActive: { $ne: false } }, updateData, { new: true });
+    if (!template) throw new Error('TEMPLATE_NOT_FOUND');
+    return template;
+  },
+
+  async deleteTemplate(id: string): Promise<ITemplate> {
+    const template = await templateRepository.delete(id);
+    if (!template) throw new Error('TEMPLATE_NOT_FOUND');
+    return template;
+  },
+
+  async deleteOwnTemplate(id: string, userId: string): Promise<ITemplate> {
+    if (!mongoose.Types.ObjectId.isValid(id)) throw new Error('TEMPLATE_NOT_FOUND');
+    const template = await Template.findOneAndUpdate({ _id: id, ownerId: userId, isActive: { $ne: false } }, { isActive: false }, { new: true });
+    if (!template) throw new Error('TEMPLATE_NOT_FOUND');
+    return template;
+  },
+
+  /**
+   * `ownerId`'s own private template handed to `organizerId` as their own copy (one copy per organizer, however many events use it).
+   * Null when `ownerId` does not own an active template with this id. Deleting the original later does not affect the copy.
+   */
+  async copyOwnTemplateFor(templateId: string, ownerId: string, organizerId: string): Promise<string | null> {
+    if (!mongoose.Types.ObjectId.isValid(templateId)) return null;
+    const source: any = await Template.findOne({ _id: templateId, ownerId, isSystemTemplate: { $ne: true }, isActive: { $ne: false } }).lean();
+    if (!source) return null;
+    const existing = await Template.findOne({ ownerId: organizerId, copiedFromId: source._id, isActive: { $ne: false } }).select('_id').lean();
+    if (existing) return String(existing._id);
+    const { _id, createdAt, updatedAt, __v, ...rest } = source;
+    const copy = await Template.create({ ...rest, ownerId: organizerId, copiedFromId: _id, isSystemTemplate: false, isPublished: true });
+    return String(copy._id);
+  },
+
+  /** May an event owned by `organizerId` use this template? Legacy/system templates always; an owned template only by its owner. */
+  async isUsableByOrganizer(templateId: string, organizerId: string): Promise<boolean> {
+    if (!mongoose.Types.ObjectId.isValid(templateId)) return false;
+    const template = await Template.findById(templateId).select('ownerId isSystemTemplate isPublished isActive').lean();
+    if (!template) return false;
+    if (!template.ownerId) return true;
+    if (template.isActive === false) return false;
+    return String(template.ownerId) === String(organizerId) || (template.isSystemTemplate === true && template.isPublished === true);
+  }
+};

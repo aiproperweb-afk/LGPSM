@@ -1,0 +1,121 @@
+import { z } from 'zod';
+import { isAcceptedImageKey } from '../utils/mediaKey';
+import { CARD_DESIGNS } from '../models/Template';
+import { CARD_INFO_FIELDS } from '../utils/cardInfo';
+import { CANVAS_PRESET_IDS, designSpecSchema } from '../services/cardTemplates/designSpec';
+
+export const createTemplateSchema = z.object({
+  name: z.string().min(2).max(100),
+  categoryId: z.string().regex(/^[0-9a-fA-F]{24}$/).optional(),
+  subcategoryId: z.string().regex(/^[0-9a-fA-F]{24}$/).optional(),
+  previewImageKey: z.string().refine(isAcceptedImageKey, 'Invalid template image reference').optional(),
+  templateData: z.record(z.string(), z.any()).optional(),
+  // CUSTOM designs only come from the AI generation workflow, which validates and stores their specification
+  cardDesign: z.enum(CARD_DESIGNS.filter((d) => d !== 'CUSTOM') as unknown as [string, ...string[]]).optional(),
+  isSystemTemplate: z.boolean().optional(),
+  isPublished: z.boolean().optional()
+});
+
+// "Upload your own template": a name, the event type it is for, and the uploaded design (an image this person uploaded)
+const zoneSchema = z.object({
+  role: z.enum(['title', 'dateTime', 'venue', 'inviteeName', 'inviteeMeta', 'qr']),
+  x: z.number().finite().min(0).max(4000), y: z.number().finite().min(0).max(4000), w: z.number().finite().min(4).max(4000), h: z.number().finite().min(4).max(4000),
+  lines: z.number().int().min(1).max(8).default(1),
+  color: z.string().regex(/^#[0-9a-fA-F]{6}$/),
+  fontFamily: z.enum(['Inter', 'Manrope', 'Playfair Display', 'Ancizar Serif', 'Alexandria', 'Alkatra', 'Alex Brush', 'Birthstone']),
+  fontWeight: z.union([z.literal(400), z.literal(500), z.literal(600), z.literal(700)]).default(400),
+  align: z.enum(['left', 'center', 'right']).default('center'),
+  erase: z.boolean().optional(),
+  frame: z.boolean().optional()
+}).strict();
+/** The areas of an uploaded design whose wording is replaced by the event's details (at most one per kind) */
+export const textZonesSchema = z.object({ zones: z.array(zoneSchema).max(6) }).strict().refine((b) => new Set(b.zones.map((z) => z.role)).size === b.zones.length, 'Each detail can have one area');
+
+export const uploadTemplateSchema = z.object({
+  // optional: an unnamed upload is called "Uploaded template" with the date
+  name: z.string().trim().min(2).max(100).optional().or(z.literal('')),
+  categoryId: z.string().regex(/^[0-9a-fA-F]{24}$/).optional(),
+  subcategoryId: z.string().regex(/^[0-9a-fA-F]{24}$/).optional(),
+  imageKey: z.string().refine((k) => /^media:[0-9a-fA-F]{24}$/.test(k), 'Upload the design as an image first')
+}).strict();
+
+export const updateTemplateSchema = createTemplateSchema.partial();
+
+// An organizer editing their own AI template: a name, whether it is available for their events, and (re-validated
+// in full) its design. Everything that decides who owns or can see it stays out of reach.
+export const updateOwnTemplateSchema = z
+  .object({
+    name: z.string().min(2).max(100).optional(),
+    isPublished: z.boolean().optional(),
+    categoryId: z.string().regex(/^[0-9a-fA-F]{24}$/).optional(),
+    subcategoryId: z.string().regex(/^[0-9a-fA-F]{24}$/).optional(),
+    designSpec: designSpecSchema.optional()
+  })
+  .strict();
+
+export const renderTemplateForEventSchema = z
+  .object({
+    eventId: z.string().regex(/^[0-9a-fA-F]{24}$/),
+    registrationUrl: z.string().url().max(300).refine((u) => /^https:\/\//i.test(u), 'The registration link must be an https link').optional(),
+    format: z.enum(['png', 'jpeg']).optional()
+  })
+  .strict();
+
+export const MOODS = ['elegant', 'modern', 'playful', 'corporate', 'festive', 'minimal', 'traditional'] as const;
+
+export const createGenerationSchema = z
+  .object({
+    kind: z.enum(['INVITATION', 'POSTER']),
+    preset: z.enum(CANVAS_PRESET_IDS),
+    prompt: z.string().trim().min(10, 'Describe the design in at least 10 characters').max(800, 'Keep the description under 800 characters'),
+    style: z
+      .object({
+        mood: z.enum(MOODS).optional(),
+        colorHint: z.string().trim().max(40).regex(/^[\p{L}\p{N} #,/&-]*$/u, 'Use plain words or hex colours').optional()
+      })
+      .strict()
+      .optional(),
+    variantCount: z.number().int().min(1).max(3).optional(),
+    idempotencyKey: z.string().trim().min(8).max(80).regex(/^[A-Za-z0-9_-]+$/).optional()
+  })
+  .strict();
+
+export const changeGenerationSchema = z
+  .object({
+    prompt: z.string().trim().min(5, 'Describe what to change').max(500, 'Keep the request under 500 characters'),
+    variantCount: z.number().int().min(1).max(3).optional(),
+    idempotencyKey: z.string().trim().min(8).max(80).regex(/^[A-Za-z0-9_-]+$/).optional()
+  })
+  .strict();
+
+export const saveVariantSchema = z
+  .object({
+    name: z.string().trim().min(2).max(100),
+    categoryId: z.string().regex(/^[0-9a-fA-F]{24}$/).optional(),
+    subcategoryId: z.string().regex(/^[0-9a-fA-F]{24}$/).optional(),
+    publish: z.boolean().optional(),
+    /** save the design over this existing template instead of creating a new one */
+    replaceTemplateId: z.string().regex(/^[0-9a-fA-F]{24}$/).optional()
+  })
+  .strict();
+
+// What the Add Event form has entered so far; everything is optional and short, and only uploaded media may be used
+// as an image (no URL is ever fetched for a preview).
+export const previewTemplateCardSchema = z
+  .object({
+    title: z.string().max(100).optional(),
+    startIso: z.string().max(40).optional(),
+    endIso: z.string().max(40).optional(),
+    venue: z.string().max(300).optional(),
+    locationSub: z.string().max(100).optional(),
+    isVirtual: z.boolean().optional(),
+    categoryName: z.string().max(100).optional(),
+    subcategoryName: z.string().max(100).optional(),
+    logoKey: z.string().regex(/^media:[0-9a-fA-F]{24}$/, 'Only an uploaded image can be previewed').optional(),
+    guestName: z.string().max(100).optional(),
+    companyName: z.string().max(100).optional(),
+    contactNumber: z.string().trim().max(30).optional(),
+    cardDisplay: z.object({ title: z.boolean().optional(), qr: z.boolean().optional(), dateTime: z.boolean().optional(), location: z.boolean().optional(), inviteeName: z.boolean().optional(), logo: z.boolean().optional() }).strict().optional(),
+    cardInfo: z.object({ primary: z.enum(CARD_INFO_FIELDS).nullable(), secondary: z.enum(CARD_INFO_FIELDS).nullable(), identityLabel: z.string().trim().max(40).nullable().optional(), secondaryIdentityLabel: z.string().trim().max(40).nullable().optional(), showIdentityLabel: z.boolean().optional(), showSecondaryIdentityLabel: z.boolean().optional() }).strict().optional()
+  })
+  .strict();

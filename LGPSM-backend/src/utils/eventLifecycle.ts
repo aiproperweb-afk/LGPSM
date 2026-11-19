@@ -1,0 +1,52 @@
+import { EventStatus } from '../models/Event';
+import { clock } from './clock';
+
+/**
+ * Server-side event lifecycle. Status is never taken from a client request body: it only changes through the
+ * explicit operations below (close, cancel), each of which checks the transition here.
+ *
+ *   DRAFT      -> PUBLISHED | CANCELLED
+ *   PUBLISHED  -> COMPLETED | CANCELLED
+ *   COMPLETED  -> (terminal; history is kept)
+ *   CANCELLED  -> (terminal)
+ *
+ * Events are created PUBLISHED today (DRAFT is not reachable from the UI yet), so DRAFT -> PUBLISHED is listed for
+ * the later publish phase and is not exposed by an endpoint.
+ */
+const TRANSITIONS: Record<EventStatus, readonly EventStatus[]> = {
+  [EventStatus.DRAFT]: [EventStatus.PUBLISHED, EventStatus.CANCELLED],
+  [EventStatus.PUBLISHED]: [EventStatus.COMPLETED, EventStatus.CANCELLED],
+  [EventStatus.COMPLETED]: [],
+  [EventStatus.CANCELLED]: []
+};
+
+/**
+ * An event is over once it was closed, or once its end time has passed: nobody has to press anything. Entry and QR passes
+ * already stop at that moment (the admission window); this is the same test for the rules that wait until an event is over.
+ */
+export const eventHasEnded = (event: { status?: string; schedule?: { end?: Date | string | null } | null }, now: Date = clock.now()): boolean => {
+  if (event.status === EventStatus.COMPLETED) return true;
+  if (event.status !== EventStatus.PUBLISHED) return false;
+  const end = event.schedule?.end ? new Date(event.schedule.end) : null;
+  return !!end && !Number.isNaN(end.getTime()) && end.getTime() <= now.getTime();
+};
+
+/**
+ * A closed, cancelled or finished (end time passed) event is a historical record: its guests, sessions and staff no longer change.
+ * Throws a 409 the global error handler reports as it stands.
+ */
+export function assertEventOpenForChanges(event: { status?: string; schedule?: { end?: Date | string | null } | null }): void {
+  if (event.status === EventStatus.COMPLETED || event.status === EventStatus.CANCELLED) {
+    throw {
+      statusCode: 409,
+      code: 'EVENT_CLOSED',
+      message: event.status === EventStatus.CANCELLED ? 'This event has been cancelled, so it can no longer be changed.' : 'This event has been closed, so it can no longer be changed.',
+    };
+  }
+  // an event whose end time has passed is over too (nobody has to press anything): its guests, sessions and staff no longer change
+  if (eventHasEnded(event)) {
+    throw { statusCode: 409, code: 'EVENT_ENDED', message: 'This event is over, so it can no longer be changed.' };
+  }
+}
+
+export const canTransition = (from: EventStatus, to: EventStatus): boolean => TRANSITIONS[from]?.includes(to) ?? false;

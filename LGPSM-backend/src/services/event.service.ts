@@ -1,0 +1,582 @@
+import { activeAssignmentsOf } from './systemUserAssignment.service';
+import { canUseCategory } from './category.service';
+import { eventRepository, EventFilter, Pagination } from '../repositories/event.repository';
+import { IEvent, Event, EventStatus } from '../models/Event';
+import { Category } from '../models/Category';
+import { templateService } from './template.service';
+import { Session } from '../models/Session';
+import { Invitee } from '../models/Invitee';
+import { Invitation, InvitationDeliveryStatus } from '../models/Invitation';
+import { CheckIn } from '../models/CheckIn';
+import { SystemUserAssignment } from '../models/SystemUserAssignment';
+import { Role } from '../models/User';
+import mongoose from 'mongoose';
+import { Template } from '../models/Template';
+import { EVENT_TITLE_MAX_LENGTH } from '../constants/eventLimits';
+import { masterCardOnly } from '../constants/masterCard';
+import { ensureMasterTemplate } from './cardTemplates/defaultTemplates';
+
+/** Is this template an uploaded design owned by this organizer (the one kind that is kept while the master card is the only shared design)? */
+async function isOwnUploadOf(templateId: unknown, organizerId: string): Promise<boolean> {
+  if (!templateId || !mongoose.Types.ObjectId.isValid(String(templateId)) || !mongoose.Types.ObjectId.isValid(organizerId)) return false;
+  return !!(await Template.exists({ _id: String(templateId), ownerId: organizerId, cardDesign: 'CUSTOM', isActive: { $ne: false } }));
+}
+import { findManageableEvent } from '../utils/eventAccess';
+import { platformSettingsService } from './platformSettings.service';
+import { alertService } from './alert.service';
+import { cancellationNoticeService } from './cancellationNotice.service';
+import { validateAdmissionInput } from '../utils/admissionWindow';
+import { canTransition, eventHasEnded } from '../utils/eventLifecycle';
+import { formatCardDate, formatCardTime } from '../utils/invitationContent';
+import { User } from '../models/User';
+import { CredentialEvent } from '../models/CredentialEvent';
+import { PassNotice } from '../models/PassNotice';
+import { CancellationNotice } from '../models/CancellationNotice';
+import { InviteeSet } from '../models/InviteeSet';
+import { Notification } from '../models/Notification';
+import { Media, MediaPurpose } from '../models/Media';
+
+// Client-writable event fields. Anything else in a request body (organizerId, status flags,
+// operationalDataCleared, pricing, ...) is server-controlled and is dropped before it reaches the database.
+const EVENT_WRITABLE_FIELDS = [
+  'title', 'description', 'categoryId', 'subcategoryId', 'format', 'location', 'contactNumber',
+  'schedule', 'admission', 'rsvp', 'attendeeSettings', 'dietaryPreference', 'templateId', 'cardInfo', 'cardDisplay', 'media'
+] as const;
+/**
+ * Clients send a pin as [longitude, latitude]; the database keeps a GeoJSON Point (which the 2dsphere index needs).
+ * Anything that is not a real coordinate pair is dropped, so a bad value can never reach the index.
+ */
+export function normalizeLocation(location: any) {
+  if (!location || typeof location !== 'object' || Array.isArray(location)) return location;
+  const { coordinates, ...rest } = location;
+  const pair = Array.isArray(coordinates) ? coordinates : coordinates?.type === 'Point' ? coordinates.coordinates : null;
+  const valid = Array.isArray(pair) && pair.length === 2 && pair.every((n: unknown) => typeof n === 'number' && Number.isFinite(n))
+    && Math.abs(pair[0]) <= 180 && Math.abs(pair[1]) <= 90;
+  return valid ? { ...rest, coordinates: { type: 'Point', coordinates: [pair[0], pair[1]] } } : rest;
+}
+
+const pickEventFields = (data: any, extra: readonly string[] = []) => {
+  const out: Record<string, any> = {};
+  for (const key of [...EVENT_WRITABLE_FIELDS, ...extra]) {
+    if (data && data[key] !== undefined) out[key] = data[key];
+  }
+  if (out.location !== undefined) out.location = normalizeLocation(out.location);
+  return out;
+};
+
+/**
+ * An admin's uploaded design can hold fewer title characters than the usual limit (templateData.titleMaxChars, worked out from its title area).
+ * The Add Event form applies the same number; the server checks it too, so the two always agree.
+ */
+async function assertTitleFitsTemplate(templateId: unknown, title: unknown): Promise<void> {
+  if (!templateId || typeof title !== 'string' || !mongoose.Types.ObjectId.isValid(String(templateId))) return;
+  const t = await Template.findById(String(templateId)).select('templateData').lean();
+  const max = Number((t?.templateData as any)?.titleMaxChars);
+  if (Number.isFinite(max) && max > 0 && title.trim().length > Math.min(EVENT_TITLE_MAX_LENGTH, max)) {
+    throw { statusCode: 400, message: `Title cannot exceed ${Math.min(EVENT_TITLE_MAX_LENGTH, max)} characters on this template.` };
+  }
+}
+
+export class EventService {
+  /** True once any invitation for the event was sent or attempted (the event is locked from then on). */
+  async invitationsStarted(eventId: string | mongoose.Types.ObjectId): Promise<boolean> {
+    return !!(await Invitation.exists({ eventId, status: { $in: [InvitationDeliveryStatus.SENT, InvitationDeliveryStatus.FAILED] } }));
+  }
+
+  /**
+   * Creates a new event for an organizer.
+   *
+   * Rate Locking & Pricing Business Rule:
+   * - When an event is created, `platformSettingsService.currentRateSnapshot()` captures the global
+   *   per-invitee price rate in effect at that moment.
+   * - This rate (`pricing.lockedRatePerInvitee`) is permanently locked to the event.
+   * - Subsequent changes to the platform's global price rate (by Super Admin) do NOT modify existing
+   *   or historical event rates.
+   */
+  async createEvent(organizerId: string, rawEventData: any, adminActorId?: string): Promise<IEvent> {
+    // The owner is always the authenticated caller (or, for admins, the id the controller passes in)
+    const eventData: any = pickEventFields(rawEventData, ['startDate', 'endDate']);
+    // Resolve Category
+    let categoryId = eventData.categoryId;
+    let categoryExists = categoryId && mongoose.Types.ObjectId.isValid(categoryId) 
+      ? await Category.findById(categoryId) 
+      : null;
+
+    // another organizer's custom category is treated as missing
+    if (categoryExists && !(await canUseCategory(String(categoryId), eventData.subcategoryId ? String(eventData.subcategoryId) : undefined, String(organizerId)))) categoryExists = null;
+
+    if (categoryId && !categoryExists) {
+      const err: any = new Error('CATEGORY_NOT_FOUND');
+      err.statusCode = 400;
+      throw err;
+    }
+
+    if (!categoryExists) {
+      // the platform's own General, never an organizer's private category that happens to share the name
+      let defaultCat = await Category.findOne({ name: 'General', ownerId: null });
+      if (!defaultCat) {
+        defaultCat = await Category.create({ name: 'General', isActive: true });
+      }
+      categoryId = defaultCat?._id;
+    }
+
+    // Validate Template if provided
+    if (eventData.templateId && mongoose.Types.ObjectId.isValid(eventData.templateId)) {
+      // a template another organizer owns is treated like a missing one
+      if (!(await templateService.isUsableByOrganizer(String(eventData.templateId), String(organizerId)))) {
+        // An admin creating this event for an organizer may have picked a design they uploaded themselves: the organizer gets their own copy
+        const copyId = adminActorId ? await templateService.copyOwnTemplateFor(String(eventData.templateId), adminActorId, String(organizerId)) : null;
+        if (copyId) eventData.templateId = copyId;
+        else delete eventData.templateId;
+      }
+    } else {
+      delete eventData.templateId;
+    }
+
+    // while the master card is the only shared design, every event is made with it, except one made with the organizer's own uploaded design
+    if (masterCardOnly() && !(await isOwnUploadOf(eventData.templateId, String(organizerId)))) {
+      const masterId = await ensureMasterTemplate();
+      if (masterId) eventData.templateId = masterId;
+    }
+    await assertTitleFitsTemplate(eventData.templateId, eventData.title);
+
+    const now = new Date();
+    const tomorrow = new Date(now.getTime() + 86400000);
+
+    const startVal = eventData.schedule?.start || eventData.startDate || now;
+    const endVal = eventData.schedule?.end || eventData.endDate || tomorrow;
+    const startAt = new Date(startVal), endAt = new Date(endVal);
+    if (Number.isNaN(startAt.getTime()) || Number.isNaN(endAt.getTime())) throw { statusCode: 400, message: 'Enter a valid start and end date.' };
+    if (endAt.getTime() <= startAt.getTime()) throw { statusCode: 400, message: 'The event must end after it starts.' };
+
+    // Admin event settings apply on the server too
+    await platformSettingsService.applyEventFeatureRules(eventData, true);
+
+    const targetOrganizer = organizerId;
+
+    const admissionError = validateAdmissionInput({ start: new Date(startVal), end: new Date(endVal) }, eventData.admission);
+    if (admissionError) throw { statusCode: 400, message: admissionError };
+
+    // Force organizerId and default status to PUBLISHED so it shows on event listing
+    const dataToCreate = {
+      ...eventData,
+      categoryId,
+      description: eventData.description || eventData.title || 'Event Description',
+      format: eventData.format || 'PHYSICAL',
+      schedule: {
+        start: new Date(startVal),
+        end: new Date(endVal)
+      },
+      organizerId: new mongoose.Types.ObjectId(targetOrganizer),
+      status: 'PUBLISHED',
+      // The per-invitee rate in force now is locked on the event; later rate changes do not affect it
+      pricing: await platformSettingsService.currentRateSnapshot()
+    };
+
+    const created = await eventRepository.create(dataToCreate);
+    await alertService.notifyAdmins('newEventAdded', {
+      type: 'EVENT',
+      title: 'New event added',
+      message: created.schedule?.start
+        ? `"${created.title}" was created and starts ${formatCardDate(new Date(created.schedule.start))}, ${formatCardTime(new Date(created.schedule.start))}.`
+        : `"${created.title}" was created.`,
+      entityType: 'Event',
+      entityId: created._id
+    });
+    // an administrator created it on the organizer's behalf: the organizer is told
+    if (adminActorId && String(adminActorId) !== String(targetOrganizer)) {
+      await alertService.notifyUser(targetOrganizer, {
+        type: 'EVENT',
+        title: 'An administrator created an event for you',
+        message: `"${created.title}" was created for you by an administrator. Open it to see the details, add invitees and send the invitations.`,
+        entityType: 'Event',
+        entityId: created._id
+      });
+    }
+    return created;
+  }
+
+  /** The accounts an admin may create an event for: real, active organizers. Checked before anything is created. */
+  async resolveOrganizerTargets(ids: unknown[]): Promise<string[]> {
+    const unique = [...new Set(ids.map(String))];
+    const refuse = { statusCode: 400, message: 'Choose active organizers for this event.' };
+    if (unique.length === 0 || unique.length > 200 || unique.some((id) => !/^[0-9a-fA-F]{24}$/.test(id))) throw refuse;
+    const found = await User.countDocuments({ _id: { $in: unique }, role: Role.ORGANIZER, isActive: true });
+    if (found !== unique.length) throw refuse;
+    return unique;
+  }
+
+  async getEventsByOrganizer(organizerId: string, filter: EventFilter & { organizerId?: string }, pagination: Pagination, role?: Role) {
+    // Admins can review every organizer's events (read-only); organizers only see their own
+    if (role === Role.ADMIN) {
+      return await eventRepository.findAll(filter, pagination);
+    }
+    return await eventRepository.findByOrganizer(organizerId, filter, pagination);
+  }
+
+  async getEventById(eventId: string, organizerId: string, role?: Role): Promise<IEvent> {
+    const event = role === Role.ADMIN
+      ? await Event.findById(eventId).populate('organizerId', 'fullName email')
+      : await findManageableEvent(eventId, organizerId, role);
+    if (!event) {
+      throw new Error('EVENT_NOT_FOUND');
+    }
+    return event;
+  }
+
+  // The three numbers on an event's tab strip (sessions, invitees, assigned staff) in one request, instead of three list calls.
+  // Each count matches what the corresponding list reports: the Invitee model already leaves set-aside guests out of counts.
+  async getEventCounts(eventId: string, organizerId: string, role?: Role): Promise<{ sessions: number; invitees: number; assignments: number }> {
+    const event = await findManageableEvent(eventId, organizerId, role);
+    if (!event) throw new Error('EVENT_NOT_FOUND');
+    const [sessions, invitees, assignments] = await Promise.all([
+      Session.countDocuments({ eventId }),
+      Invitee.countDocuments({ eventId }),
+      activeAssignmentsOf(eventId).then((rows) => rows.length),
+    ]);
+    return { sessions, invitees, assignments };
+  }
+
+  // Read model for detail screens: resolves the related category, subcategory and template for display
+  async getEventDetails(eventId: string, organizerId: string, role?: Role) {
+    const event = await this.getEventById(eventId, organizerId, role);
+    await event.populate([
+      { path: 'categoryId', select: 'name subcategories ownerId' },
+      { path: 'templateId', select: 'name previewImageKey isActive templateData' },
+      { path: 'organizerId', select: 'fullName email profile.organizationName profile.logoKey profile.invitationChannel' },
+    ]);
+    const json: any = event.toJSON();
+    // subcategoryId references an embedded subcategory of the category; expose its name alongside the id
+    const category: any = json.categoryId;
+    if (json.subcategoryId && category && Array.isArray(category.subcategories)) {
+      const sub = category.subcategories.find((s: any) => String(s._id) === String(json.subcategoryId));
+      if (sub) json.subcategory = { _id: sub._id, name: sub.name, isCustom: !!sub.ownerId };
+    }
+    if (category && typeof category === 'object') delete category.subcategories;
+    return json;
+  }
+
+  async updateEvent(eventId: string, organizerId: string, rawUpdateData: any, role?: string, expectedUpdatedAt?: Date): Promise<IEvent> {
+    const updateData: any = pickEventFields(rawUpdateData);
+    const existingEvent = await findManageableEvent(eventId, organizerId, role);
+    if (!existingEvent) throw new Error('EVENT_NOT_FOUND');
+    // A closed or cancelled event is a historical record
+    if (existingEvent.status === EventStatus.COMPLETED || existingEvent.status === EventStatus.CANCELLED) throw new Error('EVENT_CLOSED');
+    // ... and so is one whose end time has passed
+    if (eventHasEnded(existingEvent)) throw new Error('EVENT_ENDED');
+    // Feedback 14: once invitations have gone out (or were attempted), neither the organizer nor an admin can edit
+    // the event, so guests' cards and passes always match what was sent. The web edit form applies the same rule.
+    if (await this.invitationsStarted(existingEvent._id as any)) throw new Error('EVENT_LOCKED');
+    // The editor opened a version of the event; if someone has saved it since, this edit would silently overwrite their change
+    const staleCheck = () => { throw Object.assign(new Error('EVENT_EDIT_CONFLICT'), { currentVersion: (existingEvent as any).updatedAt }); };
+    if (expectedUpdatedAt && new Date((existingEvent as any).updatedAt).getTime() !== expectedUpdatedAt.getTime()) staleCheck();
+
+    // Validate references if they are being updated
+    const categoryChanged = !!updateData.categoryId && updateData.categoryId !== existingEvent.categoryId?.toString();
+    const subcategoryChanged = !!updateData.subcategoryId && updateData.subcategoryId !== existingEvent.subcategoryId?.toString();
+    if (categoryChanged || subcategoryChanged) {
+      // judged for the event's owner, whoever is editing: another organizer's custom category or subcategory counts as missing
+      const nextCategoryId = String(updateData.categoryId || existingEvent.categoryId);
+      const categoryExists = await Category.findById(nextCategoryId);
+      if (!categoryExists || !(await canUseCategory(nextCategoryId, updateData.subcategoryId ? String(updateData.subcategoryId) : undefined, String(existingEvent.organizerId)))) throw new Error('CATEGORY_NOT_FOUND');
+    }
+
+    if (updateData.templateId && updateData.templateId !== existingEvent.templateId?.toString()) {
+      if (!(await templateService.isUsableByOrganizer(String(updateData.templateId), String(existingEvent.organizerId)))) {
+        // An admin editing an organizer's event may pick a design they uploaded themselves: the organizer gets their own copy
+        const copyId = role === Role.ADMIN ? await templateService.copyOwnTemplateFor(String(updateData.templateId), organizerId, String(existingEvent.organizerId)) : null;
+        if (!copyId) throw new Error('TEMPLATE_NOT_FOUND');
+        updateData.templateId = copyId;
+      }
+    }
+
+    // while the master card is the only shared design, an event is only ever made with it, or with the organizer's own uploaded design
+    if (updateData.templateId && masterCardOnly() && !(await isOwnUploadOf(updateData.templateId, String(existingEvent.organizerId)))) {
+      const masterId = await ensureMasterTemplate();
+      if (masterId) updateData.templateId = masterId;
+    }
+
+    // a new title or a new template: the title must fit the template's design (older events are left as they are until one of them changes)
+    if (updateData.title !== undefined || updateData.templateId) {
+      await assertTitleFitsTemplate(updateData.templateId ?? (existingEvent.templateId as any)?._id ?? existingEvent.templateId, updateData.title ?? existingEvent.title);
+    }
+
+    // The check-in window is validated against the schedule that will be in force after this update
+    if (updateData.admission !== undefined || updateData.schedule) {
+      const admissionError = validateAdmissionInput(
+        { start: updateData.schedule?.start ?? existingEvent.schedule?.start, end: updateData.schedule?.end ?? existingEvent.schedule?.end },
+        updateData.admission !== undefined ? updateData.admission : (existingEvent as any).admission
+      );
+      if (admissionError) throw { statusCode: 400, message: admissionError };
+    }
+
+    // An event cannot start before it was created, and must end after both its start and its creation
+    if (updateData.schedule) {
+      const created = (existingEvent as any).createdAt ? new Date((existingEvent as any).createdAt).getTime() : NaN;
+      const startMs = new Date(updateData.schedule.start ?? existingEvent.schedule?.start).getTime();
+      const endMs = new Date(updateData.schedule.end ?? existingEvent.schedule?.end).getTime();
+      if (!Number.isNaN(created) && !Number.isNaN(startMs) && startMs < created) throw { statusCode: 400, message: 'The event cannot start before it was created.' };
+      if (!Number.isNaN(created) && !Number.isNaN(endMs) && endMs <= created) throw { statusCode: 400, message: 'The event must end after it was created.' };
+      if (!Number.isNaN(startMs) && !Number.isNaN(endMs) && endMs <= startMs) throw { statusCode: 400, message: 'The event must end after it starts.' };
+    }
+
+    // Disallow updating organizerId, _id, createdAt and the locked rate
+    delete updateData.organizerId;
+    delete updateData._id;
+    delete updateData.createdAt;
+    delete updateData.pricing;
+    await platformSettingsService.applyEventFeatureRules(updateData);
+
+    const updatedEvent = await eventRepository.updateByIdAndOrganizer(eventId, existingEvent.organizerId, updateData, expectedUpdatedAt);
+    if (!updatedEvent) {
+      // the version check is part of the update itself, so a save that lost the race to another one lands here
+      if (expectedUpdatedAt) {
+        const latest: any = await Event.findById(eventId).select('updatedAt').lean();
+        if (latest && latest.updatedAt && new Date(latest.updatedAt).getTime() !== expectedUpdatedAt.getTime()) throw Object.assign(new Error('EVENT_EDIT_CONFLICT'), { currentVersion: latest.updatedAt });
+      }
+      throw new Error('UPDATE_FAILED');
+    }
+
+    // an administrator changed the organizer's event: the organizer is told which event
+    if (role === Role.ADMIN && String(existingEvent.organizerId) !== String(organizerId)) {
+      await alertService.notifyUser(existingEvent.organizerId, {
+        type: 'EVENT',
+        title: 'An administrator updated your event',
+        message: `"${updatedEvent.title}" was changed by an administrator. Open the event to review the changes.`,
+        entityType: 'Event',
+        entityId: updatedEvent._id
+      });
+    }
+    return updatedEvent;
+  }
+
+  /**
+   * Change only the check-in window. Unlike a general edit this is allowed after invitations went out: the window is
+   * not printed on any card or pass, so changing it cannot make what guests received wrong, and organizers need to be
+   * able to open earlier or extend on the day. Only a PUBLISHED event can be changed; the route audits it.
+   */
+  async updateAdmission(eventId: string, actor: { userId: string; role: Role }, admission: { opensAt?: string | null; closesAt?: string | null }): Promise<IEvent> {
+    if (actor.role !== Role.ADMIN && actor.role !== Role.ORGANIZER) throw new Error('FORBIDDEN');
+    const event = await findManageableEvent(eventId, actor.userId, actor.role);
+    if (!event) throw new Error('EVENT_NOT_FOUND');
+    if (event.status !== EventStatus.PUBLISHED) throw new Error('EVENT_CLOSED');
+
+    // Merge over what is stored so a request may change one side only; null returns that side to its default
+    const current: any = (event as any).admission || {};
+    const next = {
+      opensAt: admission.opensAt !== undefined ? admission.opensAt : current.opensAt ?? null,
+      closesAt: admission.closesAt !== undefined ? admission.closesAt : current.closesAt ?? null
+    };
+    const admissionError = validateAdmissionInput(event.schedule, next);
+    if (admissionError) throw { statusCode: 400, message: admissionError };
+
+    const updated = await Event.findOneAndUpdate(
+      { _id: event._id, status: EventStatus.PUBLISHED },
+      { $set: { admission: { opensAt: next.opensAt ? new Date(next.opensAt as any) : null, closesAt: next.closesAt ? new Date(next.closesAt as any) : null } } },
+      { new: true }
+    );
+    if (!updated) throw new Error('EVENT_CLOSED');
+    return updated;
+  }
+
+  /**
+   * Cancels an event. Terminal: nothing in the app can bring a cancelled event back (a replacement event must be
+   * created instead). History is untouched; only the status changes and the guests who were invited are queued to be told.
+   *
+   * Idempotent: cancelling a cancelled event changes nothing and creates no second set of notices (enqueueing is
+   * keyed on guest, so repeating it can only add notices that are genuinely missing).
+   */
+  async cancelEvent(eventId: string, actor: { userId: string; role: Role }, reason?: string) {
+    if (actor.role !== Role.ADMIN && actor.role !== Role.ORGANIZER) throw new Error('FORBIDDEN');
+    const existing = await findManageableEvent(eventId, actor.userId, actor.role);
+    if (!existing) throw new Error('EVENT_NOT_FOUND');
+    if (existing.status === EventStatus.COMPLETED) throw new Error('INVALID_TRANSITION');
+    // an event that is already over is deleted, not cancelled (cancelling would tell its guests it was called off)
+    if (existing.status !== EventStatus.CANCELLED && eventHasEnded(existing)) throw new Error('INVALID_TRANSITION');
+
+    const cleanReason = typeof reason === 'string' ? reason.replace(/[\u0000-\u001f\u007f]/g, ' ').trim().slice(0, 500) || undefined : undefined;
+    let alreadyCancelled = existing.status === EventStatus.CANCELLED;
+    let event: any = existing;
+
+    if (!alreadyCancelled) {
+      // Conditional + atomic: the status, its metadata and the admission counter freeze change together, so a check-in
+      // is either entirely before the cancellation or refused after it.
+      const cancelled = await Event.findOneAndUpdate(
+        { _id: existing._id, status: { $in: [EventStatus.PUBLISHED, EventStatus.DRAFT] } },
+        [{ $set: {
+          status: EventStatus.CANCELLED,
+          cancelledAt: new Date(),
+          cancelledBy: new mongoose.Types.ObjectId(actor.userId),
+          cancelledByRole: actor.role,
+          ...(cleanReason ? { cancellationReason: cleanReason } : {}),
+          finalAdmissionSeq: { $ifNull: ['$admissionSeq', 0] }
+        } }],
+        { new: true, updatePipeline: true, timestamps: false }
+      );
+      if (cancelled) event = cancelled;
+      else {
+        // lost a race with another cancel (fine) or with a close (not fine)
+        const now: any = await Event.findById(existing._id);
+        if (!now) throw new Error('EVENT_NOT_FOUND');
+        if (now.status !== EventStatus.CANCELLED) throw new Error('INVALID_TRANSITION');
+        alreadyCancelled = true;
+        event = now;
+      }
+    }
+
+    // who cancelled is told to the other side: the administrators when an organizer cancels, the organizer when an administrator does
+    if (!alreadyCancelled) {
+      const byAdmin = actor.role === Role.ADMIN;
+      const content = {
+        type: 'EVENT',
+        title: 'Event cancelled',
+        message: byAdmin
+          ? `"${event.title}" was cancelled by an administrator${cleanReason ? `: ${cleanReason}` : '.'}`
+          : `"${event.title}" was cancelled by its organizer${cleanReason ? `: ${cleanReason}` : '.'}`,
+        entityType: 'Event',
+        entityId: event._id
+      };
+      if (byAdmin) await alertService.notifyUser(event.organizerId, content);
+      else await alertService.notifyAdmins('eventCancelled', content, { email: false });
+    }
+
+    // Stored first, sent afterwards: a provider outage can never undo or block the cancellation
+    const queued = await cancellationNoticeService.enqueueForEvent(event);
+    if (queued.eligible > 0) {
+      cancellationNoticeService.processEvent(event._id).catch((e) => console.error('Cancellation notice dispatch failed:', e?.message));
+    }
+    return { event, alreadyCancelled, notices: queued };
+  }
+
+  /** The event, for reading or retrying its cancellation notices: admin or the owning organizer only (never staff). */
+  async findForNotices(eventId: string, actor: { userId: string; role: Role }): Promise<IEvent> {
+    if (actor.role !== Role.ADMIN && actor.role !== Role.ORGANIZER) throw new Error('FORBIDDEN');
+    const event = await findManageableEvent(eventId, actor.userId, actor.role);
+    if (!event) throw new Error('EVENT_NOT_FOUND');
+    return event;
+  }
+
+  /**
+   * Non-destructive close: PUBLISHED -> COMPLETED. Nothing is deleted; sessions, invitees, invitations, RSVPs,
+   * check-ins, assignments, reports and audit entries all stay available. Admin may close any event, an organizer
+   * only their own.
+   */
+  async closeEvent(eventId: string, actor: { userId: string; role: Role }): Promise<IEvent> {
+    if (actor.role !== Role.ADMIN && actor.role !== Role.ORGANIZER) throw new Error('FORBIDDEN_CLOSE');
+    const event = await findManageableEvent(eventId, actor.userId, actor.role);
+    if (!event) throw new Error('EVENT_NOT_FOUND');
+    if (!canTransition(event.status, EventStatus.COMPLETED)) throw new Error('INVALID_TRANSITION');
+
+    // Conditional update so two concurrent closes (or a close racing a cancel) cannot both win
+    // One atomic update that also freezes the admission counter: every admission writes the same document inside its
+    // own transaction, so a check-in and this close are strictly ordered (see checkIn.service `commitAdmission`).
+    const closed = await Event.findOneAndUpdate(
+      { _id: event._id, status: EventStatus.PUBLISHED },
+      [{ $set: { status: EventStatus.COMPLETED, closedAt: new Date(), closedBy: new mongoose.Types.ObjectId(actor.userId), finalAdmissionSeq: { $ifNull: ['$admissionSeq', 0] } } }],
+      { new: true, updatePipeline: true, timestamps: false }
+    );
+    if (!closed) throw new Error('INVALID_TRANSITION');
+    return closed;
+  }
+
+  /**
+   * PERMANENT deletion of an event's operational data (admin only, irreversible). It is a separate operation from
+   * closing: the event must already be over (end time passed, or closed), the caller must retype the event title, and the
+   * event record itself is kept so reports of what existed remain attributable.
+   */
+  /**
+   * "Delete event" for an event that is over: the event itself and all of its data are removed for good (its guests, sessions,
+   * invitations, check-ins, staff assignments, passes and notices, and its uploaded image). The owning organizer or an admin,
+   * only after the event has ended, and only with the event title typed to confirm. The audit trail is kept, so who deleted
+   * what stays on record.
+   */
+  async deleteEventPermanently(eventId: string, actor: { userId: string; role: string }, confirmTitle?: string): Promise<{ title: string }> {
+    if (actor.role !== Role.ADMIN && actor.role !== Role.ORGANIZER) throw new Error('EVENT_NOT_FOUND');
+    const event = await findManageableEvent(eventId, actor.userId, actor.role);
+    if (!event) throw new Error('EVENT_NOT_FOUND');
+    // past = closed, or its end time has passed (a cancelled event that is over counts too)
+    const endAt = event.schedule?.end ? new Date(event.schedule.end).getTime() : NaN;
+    const isPast = event.status === EventStatus.COMPLETED || (!Number.isNaN(endAt) && endAt <= Date.now());
+    if (!isPast) throw new Error('EVENT_NOT_CLOSED');
+    if (!confirmTitle || confirmTitle.trim() !== String(event.title).trim()) throw new Error('CONFIRMATION_REQUIRED');
+    await purgeOperationalData(eventId);
+    const logoKey = (event as any).media?.logoKey;
+    if (typeof logoKey === 'string' && /^media:[0-9a-fA-F]{24}$/.test(logoKey)) {
+      await Media.deleteOne({ _id: logoKey.slice(6), purpose: MediaPurpose.EVENT_LOGO });
+    }
+    await Event.deleteOne({ _id: event._id });
+    return { title: String(event.title) };
+  }
+
+  async cleanupEventOperationalData(eventId: string, actor: { userId: string; role: Role }, confirmTitle?: string): Promise<any> {
+    // 1. Authorization: Only ADMIN
+    if (actor.role !== Role.ADMIN) {
+      throw new Error('FORBIDDEN_CLEANUP');
+    }
+
+    // 2. Fetch Event
+    const event = await Event.findById(eventId);
+    if (!event) {
+      throw new Error('EVENT_NOT_FOUND');
+    }
+
+    // 3. Idempotency: If already cleared
+    if (event.operationalDataCleared) {
+      return {
+        event,
+        alreadyCleared: true,
+        cleanedCounts: { sessions: 0, invitees: 0, invitations: 0, checkIns: 0, assignments: 0 }
+      };
+    }
+
+    // 4. Only an event that is over (its end time has passed, or it was closed) can be purged
+    if (!eventHasEnded(event)) {
+      throw new Error('EVENT_NOT_CLOSED');
+    }
+    if (!confirmTitle || confirmTitle.trim() !== String(event.title).trim()) {
+      throw new Error('CONFIRMATION_REQUIRED');
+    }
+
+    // 5. Delete the event's operational data. Not a transaction (it can be far larger than one should be), so the "cleared" mark is
+    // written last: an interrupted purge is finished by repeating it. Accounts and the audit trail are kept.
+    const { sessionRes, inviteeRes, invitationRes, checkInRes, assignmentRes } = await purgeOperationalData(eventId);
+
+    event.operationalDataCleared = true;
+    await event.save();
+
+    return {
+      event,
+      alreadyCleared: false,
+      cleanedCounts: {
+        sessions: sessionRes.deletedCount || 0,
+        invitees: inviteeRes.deletedCount || 0,
+        invitations: invitationRes.deletedCount || 0,
+        checkIns: checkInRes.deletedCount || 0,
+        assignments: assignmentRes.deletedCount || 0,
+      }
+    };
+  }
+}
+
+/** Deletes everything an event's guests, sessions and passes are made of. Accounts and the audit trail are not touched. */
+async function purgeOperationalData(eventId: string) {
+  const eventObjId = new mongoose.Types.ObjectId(eventId);
+  const [sessionRes, inviteeRes, invitationRes, checkInRes, assignmentRes] = await Promise.all([
+    Session.deleteMany({ eventId: eventObjId }),
+    Invitee.deleteMany({ eventId: eventObjId }).setOptions({ includeArchived: true } as any),
+    Invitation.deleteMany({ eventId: eventObjId }),
+    CheckIn.deleteMany({ eventId: eventObjId }),
+    SystemUserAssignment.deleteMany({ eventId: eventObjId }),
+  ]);
+  // Everything else that names the event's guests or their passes goes with them
+  await Promise.all([
+    CredentialEvent.deleteMany({ eventId: eventObjId }),
+    PassNotice.deleteMany({ eventId: eventObjId }),
+    CancellationNotice.deleteMany({ eventId: eventObjId }),
+    InviteeSet.deleteMany({ eventId: eventObjId }),
+    Notification.deleteMany({ entityType: 'Event', entityId: eventObjId }),
+  ]);
+  return { sessionRes, inviteeRes, invitationRes, checkInRes, assignmentRes };
+}
+
+export const eventService = new EventService();

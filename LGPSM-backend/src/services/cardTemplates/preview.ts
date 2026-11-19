@@ -1,0 +1,80 @@
+import { withCurrentLayout } from './uploadedTemplate';
+import { Template } from '../../models/Template';
+import { generateQRCodeDataURL } from '../../utils/qr.util';
+import { previewSampleUrl } from '../../utils/qrPayload';
+import { resolveImageKeyBase64 } from '../../utils/resolveImageBase64';
+import { invitationCardService } from '../invitationCard.service';
+import { resolveCardDesign } from './designs';
+import { safeParseDesignSpec } from './designSpec';
+import { cardGuestLines, CardInfo } from '../../utils/cardInfo';
+import { templateVisibleTo } from '../template.service';
+import { masterCardOnly } from '../../constants/masterCard';
+
+export interface TemplatePreviewInput {
+  title?: string;
+  startIso?: string;
+  endIso?: string;
+  venue?: string;
+  locationSub?: string;
+  isVirtual?: boolean;
+  categoryName?: string;
+  subcategoryName?: string;
+  logoKey?: string;
+  guestName?: string;
+  companyName?: string;
+  cardInfo?: CardInfo;
+  contactNumber?: string;
+  cardDisplay?: { title?: boolean; qr?: boolean; dateTime?: boolean; location?: boolean; inviteeName?: boolean; logo?: boolean };
+}
+
+/**
+ * The card a template produces for the event being entered, with a placeholder guest and a clearly marked sample QR.
+ * Lets the Add Event form show the real card (and the wording written for this kind of event) before anything is saved.
+ */
+export async function renderTemplatePreview(templateId: string | null, input: TemplatePreviewInput, isAdmin: boolean, userId?: string): Promise<Buffer> {
+  // With no template chosen the card still gets the design that suits the event type, exactly as it will when sent
+  // (while the master card is the only design, the preview is always the master card, whatever template the form still remembers)
+  // (the person's own uploaded design is still drawn while the master card is the only shared one)
+  const loaded = templateId ? await Template.findOne({ _id: templateId, isActive: { $ne: false } }).select('cardDesign isPublished isSystemTemplate isActive ownerId kind designSpec templateData').lean() : null;
+  const ownUpload = !!loaded && (loaded as any).cardDesign === 'CUSTOM' && !!(loaded as any).ownerId && !!userId && String((loaded as any).ownerId) === String(userId);
+  const rawTemplate = !masterCardOnly() || ownUpload ? loaded : null;
+  // organizers only see what the template list shows them: published templates and their own, never another organizer's
+  if (templateId && (!masterCardOnly() || ownUpload) && (!rawTemplate || !templateVisibleTo(rawTemplate as any, { userId, isAdmin }))) throw new Error('TEMPLATE_NOT_FOUND');
+  // (an admin's upload saved before the design's own wording was read has it read now, once)
+  const template = await withCurrentLayout(rawTemplate as any);
+  // a custom design is drawn from its stored specification
+  const spec = template?.cardDesign === 'CUSTOM' ? safeParseDesignSpec(template.designSpec) : null;
+  if (template?.cardDesign === 'CUSTOM' && !spec?.ok) throw new Error('TEMPLATE_NOT_USABLE');
+
+  const cardDesign = resolveCardDesign({
+    templateDesign: template?.cardDesign,
+    categoryName: input.categoryName,
+    subcategoryName: input.subcategoryName,
+    title: input.title
+  });
+  const invitationUrl = previewSampleUrl();
+  return invitationCardService.generateInvitationCardPNG({
+    // The Add/Edit Event form's "Additional Info" and "Invitee Name" choices show their sample lines until there are real guests (also when only the name box is set)
+    invitee: input.cardInfo || input.cardDisplay?.inviteeName !== undefined ? cardGuestLines(null, input.cardInfo, input.cardDisplay) : { name: input.guestName?.trim() || 'Guest Name', companyName: input.companyName?.trim() || '' },
+    event: {
+      title: input.title?.trim() || 'Your event title',
+      venue: input.venue,
+      locationSub: input.locationSub,
+      startIso: input.startIso,
+      endIso: input.endIso,
+      categoryName: input.categoryName,
+      subcategoryName: input.subcategoryName,
+      isVirtual: input.isVirtual,
+      contactNumber: input.contactNumber,
+      photoBase64: input.logoKey ? await resolveImageKeyBase64(input.logoKey) : undefined
+    },
+    sessions: [],
+    // This is a preview of the template, so the designers' sample photo stands in until an image is uploaded
+    isPreview: true,
+    qrDataUrl: await generateQRCodeDataURL(invitationUrl),
+    invitationUrl,
+    cardDisplay: input.cardDisplay,
+    cardDesign: spec?.ok ? 'CUSTOM' : cardDesign,
+    designSpec: spec?.ok ? spec.spec : undefined
+  });
+}

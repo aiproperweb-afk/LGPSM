@@ -1,0 +1,79 @@
+import { z } from 'zod';
+import { optionalPhoneSchema } from './phone.validator';
+
+export const registerSchema = z.object({
+  fullName: z.string().trim().min(2, 'Full name must be at least 2 characters').max(120, 'Full name is too long'),
+  email: z.string().trim().toLowerCase().email('Invalid email format'),
+  password: z.string().min(8, 'Password must be at least 8 characters'),
+  phone: optionalPhoneSchema,
+  role: z.enum(['ADMIN', 'ORGANIZER', 'SYSTEM_USER']).optional(),
+  organizationType: z.enum(['INDIVIDUAL', 'ORGANIZATION']).optional(),
+  organizationName: z.string().trim().max(150, 'Organization name is too long').optional(),
+  // How the organizer will send invitations (asked at signup); the send screen starts with this choice
+  invitationChannel: z.enum(['EMAIL', 'WHATSAPP', 'BOTH']).optional(),
+}).superRefine((data, ctx) => {
+  if (data.organizationType === 'ORGANIZATION' && (data.organizationName?.length ?? 0) < 2) {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['organizationName'],
+      message: 'Organization name must be at least 2 characters',
+    });
+  }
+});
+
+// Mobile number is the primary identifier; email remains a valid alternative.
+// "At least one of the two" is enforced in authService.login(), not here —
+// this route's validate() middleware doesn't surface a top-level `message`
+// for Zod refine failures, only the raw field-error tree.
+export const loginSchema = z.object({
+  email: z.string().email('Invalid email format').optional(),
+  phone: optionalPhoneSchema,
+  password: z.string().min(1, 'Password is required'),
+  role: z.enum(['ADMIN', 'ORGANIZER', 'SYSTEM_USER']).optional(),
+});
+
+export const refreshTokenSchema = z.object({
+  refreshToken: z.string().min(1, 'Refresh token is required'),
+});
+
+export const forgotPasswordSchema = z.object({
+  email: z.string().email('Invalid email format'),
+  /** the portal asking, when an email is shared by several accounts (mobile app: SYSTEM_USER) */
+  role: z.enum(['ADMIN', 'ORGANIZER', 'SYSTEM_USER']).optional(),
+});
+
+export const resetPasswordSchema = z.object({
+  token: z.string().min(1, 'Reset token is required'),
+  newPassword: z.string().min(8, 'Password must be at least 8 characters'),
+});
+
+/** Validates the OTP submission from the verify-email page. */
+export const verifyEmailSchema = z.object({
+  email: z.string().email('Invalid email format'),
+  code: z
+    .string()
+    .length(6, 'Verification code must be exactly 6 digits')
+    .regex(/^\d{6}$/, 'Verification code must contain only digits'),
+});
+
+/** Validates a resend request. */
+export const resendVerificationSchema = z.object({
+  email: z.string().email('Invalid email format'),
+});
+
+/** "Change email address" on the sign-up code page: the address the code went to, the corrected one, and the password chosen in step 1 */
+export const changePendingEmailSchema = z.object({
+  email: z.string().email('Invalid email format'),
+  newEmail: z.string().trim().email('Enter a valid email address'),
+  password: z.string().min(1, 'Enter the password you chose'),
+});
+
+/** Validates the code submitted in the mobile "Forgot password" flow. */
+export const verifyResetOtpSchema = z.object({
+  email: z.string().email('Invalid email format'),
+  code: z.string().regex(/^\d{4}$/, 'Enter the 4-digit code'),
+  role: z.enum(['ADMIN', 'ORGANIZER', 'SYSTEM_USER']).optional(),
+});
+
+// "Sign in with Google": the signed ID token Google gives the browser (organizers only)
+export const googleAuthSchema = z.object({ credential: z.string().min(20).max(8192) }).strict();

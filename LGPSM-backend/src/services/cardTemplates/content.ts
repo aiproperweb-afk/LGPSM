@@ -1,0 +1,267 @@
+import { env } from '../../config/env';
+import type { TemplateDesign } from './renderer';
+
+// Generates the text for each slot of a template from the event, so every card reads like it was written for that
+// occasion: a birthday card names the guest of honour and says "Birthday Party", a wedding card names the couple and
+// uses wording that fits (wedding, reception, engagement), a corporate card shows the guest's name and company. Wording
+// lives here, one place, so it can be reviewed and changed without touching the artwork.
+
+export interface CardContentInput {
+  design: TemplateDesign;
+  title: string;
+  categoryName?: string;
+  subcategoryName?: string;
+  startIso?: string | Date | null;
+  endIso?: string | Date | null;
+  venue?: string;
+  locationSub?: string;
+  isVirtual?: boolean;
+  invitee?: { name?: string; companyName?: string; employeeId?: string };
+}
+
+// ---- dates (platform time zone, never the server's) ----
+
+const fmt = (d: Date, options: Intl.DateTimeFormatOptions) =>
+  new Intl.DateTimeFormat('en-US', { timeZone: env.APP_TIMEZONE, ...options }).format(d).replace(/[  ]/g, ' ');
+
+export function parts(d: Date) {
+  return {
+    day: fmt(d, { day: '2-digit' }),
+    dayNumber: Number(fmt(d, { day: 'numeric' })),
+    month2: fmt(d, { month: '2-digit' }),
+    monthLong: fmt(d, { month: 'long' }),
+    monthShort: fmt(d, { month: 'short' }),
+    year: fmt(d, { year: 'numeric' }),
+    year2: fmt(d, { year: '2-digit' }),
+    weekday: fmt(d, { weekday: 'long' }),
+    time: fmt(d, { hour: 'numeric', minute: '2-digit', hour12: true }),
+  };
+}
+
+/** "Thu 31 Dec 2026 2:00 PM – Fri 1 Jan 2027 4:00 PM"; "Thu 31 Dec 2026 2:00 PM – 4:00 PM" on one day; just the start when there is no end (the master card) */
+export function masterDateTime(startIso?: string | Date | null, endIso?: string | Date | null): string {
+  const start = toDate(startIso);
+  if (!start) return '';
+  const end = toDate(endIso);
+  const at = (d: Date) => `${fmt(d, { weekday: 'short' })} ${fmt(d, { day: 'numeric' })} ${fmt(d, { month: 'short' })} ${fmt(d, { year: 'numeric' })} ${fmt(d, { hour: 'numeric', minute: '2-digit', hour12: true })}`;
+  if (!end || end.getTime() <= start.getTime()) return at(start);
+  return sameDay(start, end) ? `${at(start)} – ${fmt(end, { hour: 'numeric', minute: '2-digit', hour12: true })}` : `${at(start)} – ${at(end)}`;
+}
+
+export function ordinal(n: number): string {
+  const mod100 = n % 100;
+  if (mod100 >= 11 && mod100 <= 13) return `${n}th`;
+  return `${n}${({ 1: 'st', 2: 'nd', 3: 'rd' } as Record<number, string>)[n % 10] || 'th'}`;
+}
+
+export const toDate = (v?: string | Date | null): Date | null => {
+  if (!v) return null;
+  const d = new Date(v);
+  return Number.isNaN(d.getTime()) ? null : d;
+};
+
+export const sameDay = (a: Date, b: Date) => fmt(a, { dateStyle: 'short' }) === fmt(b, { dateStyle: 'short' });
+
+/** "2nd Nov 2026" for one day, "2nd - 5th Nov 2026" across days of a month, "28th Oct to 2nd Nov 2026" across months. The year is always shown (both years when the range crosses one). */
+export function shortDateRange(start: Date | null, end: Date | null): string {
+  if (!start) return '';
+  const s = parts(start);
+  if (!end || sameDay(start, end)) return `${ordinal(s.dayNumber)} ${s.monthShort} ${s.year}`;
+  const e = parts(end);
+  // within one month the month and year are said once ("28th - 31st Oct 2026"), which also keeps the line short enough for the pill
+  if (s.monthShort === e.monthShort && s.year === e.year) return `${ordinal(s.dayNumber)} - ${ordinal(e.dayNumber)} ${s.monthShort} ${s.year}`;
+  const crossYear = s.year !== e.year;
+  return `${ordinal(s.dayNumber)} ${s.monthShort}${crossYear ? ` ${s.year}` : ''} to ${ordinal(e.dayNumber)} ${e.monthShort} ${e.year}`;
+}
+
+/** "2nd November, 2026", or "2nd - 5th November, 2026" across days of one month. */
+export function longDate(start: Date | null, end: Date | null): string {
+  if (!start) return '';
+  const s = parts(start);
+  if (!end || sameDay(start, end)) return `${ordinal(s.dayNumber)} ${s.monthLong}, ${s.year}`;
+  const e = parts(end);
+  if (s.monthLong === e.monthLong && s.year === e.year) return `${ordinal(s.dayNumber)} - ${ordinal(e.dayNumber)} ${s.monthLong}, ${s.year}`;
+  return `${ordinal(s.dayNumber)} ${s.monthShort} - ${ordinal(e.dayNumber)} ${e.monthShort}, ${e.year}`;
+}
+
+// ---- wording ----
+
+const escapeRegex = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+/**
+ * The people an event is about, taken from its title: "Moloy Birthday Celebration!!!" -> "Moloy",
+ * "Moloy Roy & Dola Kar Wedding Reception" -> "Moloy Roy & Dola Kar". The title is kept as is when nothing is left.
+ */
+export function deriveSubject(title: string, occasionWords: string[]): string {
+  let text = ` ${title} `;
+  for (const word of occasionWords) {
+    text = text.replace(new RegExp(`(^|[^\\p{L}\\p{N}'’])${escapeRegex(word)}(?=$|[^\\p{L}\\p{N}'’])`, 'giu'), '$1 ');
+  }
+  text = text
+    .replace(/[!?*#~_…]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/^(the|of|for|a|an|and|&)\s+/i, '')
+    .replace(/\s+(the|of|for|a|an|and|&|-|,)$/i, '')
+    .trim();
+  return text.length >= 2 ? text : title.trim();
+}
+
+export function initialsOf(text: string): string {
+  const letters = text
+    .split(/[\s&]+/)
+    .map((w) => Array.from(w).find((ch) => /\p{L}/u.test(ch)) || '')
+    .filter(Boolean);
+  return letters.slice(0, 2).join('').toUpperCase();
+}
+
+const BIRTHDAY_WORDS = ['birthday', 'bday', "b'day", 'b’day', 'party', 'celebration', 'celebrations', 'celebrate', 'bash', 'function', 'special', 'happy'];
+const RICE_WORDS = ['rice ceremony', 'annaprasan', 'annaprashan', 'mukhe bhaat', 'mukhebhaat', 'first rice', 'ceremony', 'celebration', 'party', 'function'];
+const WEDDING_WORDS = ['wedding', 'reception', 'marriage', 'engagement', 'ceremony', 'celebration', 'party', 'function', 'sangeet', 'haldi', 'mehendi', 'mehndi', 'anniversary', 'ring', 'sagai', 'invitation'];
+
+function weddingSubline(text: string): string {
+  if (/(engagement|ring\s*ceremony|sagai|roka)/i.test(text)) return 'are getting engaged';
+  if (/anniversary/i.test(text)) return 'are celebrating their anniversary';
+  if (/reception/i.test(text)) return 'invite you to their wedding reception';
+  if (/(haldi|mehend|mehndi|sangeet|cocktail)/i.test(text)) return 'invite you to celebrate';
+  return 'are getting married';
+}
+
+export function addressLine(input: CardContentInput): string {
+  if (input.isVirtual) return 'Online event';
+  const venue = (input.venue || '').trim();
+  const sub = (input.locationSub || '').trim();
+  if (!venue) return sub;
+  return sub && !venue.toLowerCase().includes(sub.toLowerCase()) ? `${venue}, ${sub}` : venue;
+}
+
+/**
+ * The place line for designs with a compact address slot. The organizer's Event Location is already short (it is capped for the
+ * card), so it is printed exactly as written, whatever separators it holds; the slot wraps it. The city is only a fallback when
+ * no location was given. (It used to keep just the last two comma-separated parts, which cut "Tollygunge, West Bengal, Kolkata,
+ * India" down to "Kolkata, India".)
+ */
+function shortPlace(input: CardContentInput): string {
+  if (input.isVirtual) return 'Online event';
+  return (input.venue || '').trim() || (input.locationSub || '').trim();
+}
+
+/** "Saturday, 6:00 PM – 9:00 PM" on one day; "Friday, 6:00 PM – Sunday, 9:00 AM" across days. Just the start when there is no end. */
+function timeRange(start: Date, end: Date | null, lower = false): string {
+  const c = (t: string) => (lower ? t.toLowerCase() : t);
+  const s = parts(start);
+  if (!end || end.getTime() <= start.getTime()) return `${s.weekday}, ${c(s.time)}`;
+  const e = parts(end);
+  // across days the end goes in the card's footer ("Ends …"): the slot is too small to carry two dates
+  return sameDay(start, end) ? `${s.weekday}, ${c(s.time)} – ${c(e.time)}` : `${s.weekday}, ${c(s.time)}`;
+}
+
+/** Text for every slot of the design. Slots with nothing to say are left out and stay empty on the card. */
+export function buildTemplateTexts(input: CardContentInput): Record<string, string> {
+  const start = toDate(input.startIso);
+  const end = toDate(input.endIso);
+  const p = start ? parts(start) : null;
+  const kind = `${input.subcategoryName || ''} ${input.categoryName || ''} ${input.title}`;
+  const scanLabel = 'Scan the QR code';
+  const guest = (input.invitee?.name || '').trim();
+  const company = (input.invitee?.companyName || '').trim();
+  const employeeId = (input.invitee?.employeeId || '').trim();
+
+  switch (input.design) {
+    case 'CORPORATE_V1':
+      return {
+        title: input.title,
+        inviteeName: guest,
+        inviteeMeta: employeeId ? `Employee ID #${employeeId}` : company,
+        datePill: start ? `Event Date${end && !sameDay(start, end) ? 's' : ''}: ${longDate(start, end)}` : '',
+        address: addressLine(input),
+      };
+    case 'CORPORATE_V2':
+      return {
+        title: input.title,
+        inviteeName: guest,
+        inviteeMeta: company,
+        scanLabel,
+        datePill: shortDateRange(start, end),
+        address: shortPlace(input),
+      };
+    case 'WEDDING':
+      return {
+        names: input.title.trim(),
+        subline: weddingSubline(kind),
+        timeLine: start ? timeRange(start, end) : '',
+        day: p?.day || '',
+        month: p?.month2 || '',
+        year: p?.year2 || '',
+        scanLabel,
+        address: addressLine(input),
+      };
+    case 'RICE_CEREMONY':
+      return {
+        heading: /annaprasan|annaprashan/i.test(input.subcategoryName || '') ? input.subcategoryName!.trim() : 'Rice Ceremony',
+        subline: 'of our beloved child',
+        honoree: input.title.trim(),
+        scanLabel,
+        timeLine: start ? timeRange(start, end, true) : '',
+        day: p?.day || '',
+        month: p?.month2 || '',
+        year: p?.year2 || '',
+        address: addressLine(input),
+      };
+    case 'BIRTHDAY':
+      return {
+        intro: 'Please Join us to celebrate',
+        honoree: input.title.trim(),
+        // "Birthday Party" unless the organizer's subcategory says something more specific ("First Birthday", "Birthday Bash")
+        heading: /birthday|bday/i.test(input.subcategoryName || '') && (input.subcategoryName || '').trim().split(/\s+/).length > 1 ? input.subcategoryName!.trim() : 'Birthday Party',
+        scanLabel,
+        // the year rides with the month ("November 2026"): the design has no separate slot for it, and a card without a year can be mistaken for another year's
+        month: p ? `${p.monthLong} ${p.year}` : '',
+        weekday: p?.weekday || '',
+        day: p && end && !sameDay(start!, end) ? `${p.day} – ${parts(end).day}` : p?.day || '',
+        // "At 11:00 AM", or "11:00 AM – 3:00 PM" when the event ends the same day (the slot is small, so the "At" makes way for the end time)
+        time: p ? (end && end > start! && sameDay(start!, end) ? `${p.time} – ${parts(end).time}` : `At ${p.time}`) : '',
+        address: addressLine(input),
+      };
+  }
+}
+
+/** Initials for the photo frame when no picture was uploaded: the guest of honour, or the event title. */
+export function photoInitials(input: CardContentInput, texts: Record<string, string>): string {
+  return initialsOf(texts.honoree || texts.names || input.title);
+}
+
+// ---- text for designs that are not tied to the Figma slots (AI-generated templates, see designSpec.ts) ----
+
+export interface SpecContentInput {
+  title: string;
+  description?: string;
+  startIso?: string | Date | null;
+  endIso?: string | Date | null;
+  venue?: string;
+  locationSub?: string;
+  isVirtual?: boolean;
+  organizerName?: string;
+  invitee?: { name?: string; companyName?: string; employeeId?: string };
+}
+
+/** Text for every role a custom design can show. Roles with nothing to say are omitted so the design leaves them empty. */
+export function buildSpecTexts(input: SpecContentInput): Record<string, string> {
+  const start = toDate(input.startIso);
+  const end = toDate(input.endIso);
+  const p = start ? parts(start) : null;
+  const clean = (v?: string) => (v || '').trim();
+  const texts: Record<string, string> = {
+    title: clean(input.title),
+    description: clean(input.description),
+    date: start ? longDate(start, end) : '',
+    time: p ? (end && sameDay(start!, end) ? `${p.time} – ${parts(end).time}` : p.time) : '',
+    dateTime: p ? `${p.weekday}, ${longDate(start, end)} · ${p.time}` : '',
+    venue: addressLine({ design: 'CORPORATE_V1', title: '', venue: input.venue, locationSub: input.locationSub, isVirtual: input.isVirtual }),
+    organizer: clean(input.organizerName),
+    inviteeName: clean(input.invitee?.name),
+    inviteeMeta: clean(input.invitee?.employeeId ? `Employee ID #${input.invitee.employeeId}` : input.invitee?.companyName),
+    tagline: ''
+  };
+  return Object.fromEntries(Object.entries(texts).filter(([, v]) => v));
+}

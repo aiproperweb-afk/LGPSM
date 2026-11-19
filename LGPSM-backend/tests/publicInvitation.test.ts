@@ -1,0 +1,273 @@
+import request from 'supertest';
+import mongoose from 'mongoose';
+import { MongoMemoryServer } from 'mongodb-memory-server';
+import app from '../src/app';
+import { Event } from '../src/models/Event';
+import { Invitee, InvitationStatus, RsvpStatus } from '../src/models/Invitee';
+import { generateSecureToken, hashToken } from '../src/utils/invitation.util';
+import { User, Role } from '../src/models/User';
+import { generateAccessToken } from '../src/utils/token';
+
+describe('Public Invitation & RSVP Endpoints', () => {
+  let mongoServer: MongoMemoryServer;
+  let eventId: mongoose.Types.ObjectId;
+  let inviteeId: mongoose.Types.ObjectId;
+  let rawToken: string;
+  let tokenHash: string;
+
+  beforeAll(async () => {
+    mongoServer = await MongoMemoryServer.create();
+    await mongoose.connect(mongoServer.getUri());
+  });
+
+  afterAll(async () => {
+    await mongoose.disconnect();
+    await mongoServer.stop();
+  });
+
+  beforeEach(async () => {
+    await Event.deleteMany({});
+    await Invitee.deleteMany({});
+
+    const organizerId = new mongoose.Types.ObjectId();
+    const event = await Event.create({
+      organizerId,
+      title: 'Grand Gala 2026',
+      description: 'Annual celebration',
+      categoryId: new mongoose.Types.ObjectId(),
+      format: 'PHYSICAL' as any,
+      location: { type: 'Point', address: 'Convention Hall, City', coordinates: [0, 0] } as any,
+      // RSVP is only accepted while the event has it enabled and before it closes
+      schedule: { start: new Date(), end: new Date(Date.now() + 86400e3) },
+      rsvp: { enabled: true, allowAllInvited: true, allowNotResponded: false, allowDeclined: false },
+      // Guests may only pick from the options the organizer configured
+      dietaryPreference: { enabled: true, title: 'Dietary Preference', options: ['Vegan', 'Veg', 'Non-Veg'] }
+    });
+    eventId = (event as any)._id as mongoose.Types.ObjectId;
+
+    rawToken = generateSecureToken();
+    tokenHash = hashToken(rawToken);
+
+    const invitee = await Invitee.create({
+      eventId,
+      name: 'John Guest',
+      email: 'john@example.com',
+      invitationStatus: InvitationStatus.SENT,
+      rsvpStatus: RsvpStatus.PENDING,
+      qrTokenHash: tokenHash
+    });
+    inviteeId = (invitee as any)._id as mongoose.Types.ObjectId;
+  });
+
+  describe('GET /api/v1/public/invitations/:token', () => {
+    it('should retrieve sanitized invitation details using valid token', async () => {
+      const res = await request(app).get(`/api/v1/public/invitations/${rawToken}`);
+
+      expect(res.statusCode).toBe(200);
+      expect(res.body.success).toBe(true);
+      expect(res.body.data.event).toBeDefined();
+      expect(res.body.data.event.title).toBe('Grand Gala 2026');
+      expect(res.body.data.event.description).toBe('Annual celebration');
+      expect(res.body.data.invitee).toBeDefined();
+      expect(res.body.data.invitee.name).toBe('John Guest');
+      expect(res.body.data.invitee.rsvpStatus).toBe('PENDING');
+      // Only whether guests can answer (and until when) is exposed, not the organizer's check-in rules
+      expect(res.body.data.event.rsvp).toEqual({ enabled: true, closesAt: expect.any(String) });
+
+      // Security checks: ensure raw tokens, hashes, and organizer IDs are not leaked
+      expect(res.body.data.qrTokenHash).toBeUndefined();
+      expect(res.body.data.tokenHash).toBeUndefined();
+      expect(res.body.data.token).toBeUndefined();
+      expect(res.body.data.event.organizerId).toBeUndefined();
+    });
+
+    it('tells the page RSVP is off when the event does not use it', async () => {
+      await Event.updateMany({}, { $set: { 'rsvp.enabled': false } });
+      const res = await request(app).get(`/api/v1/public/invitations/${rawToken}`);
+      expect(res.body.data.event.rsvp).toEqual({ enabled: false, closesAt: null });
+      const answer = await request(app).post(`/api/v1/public/invitations/${rawToken}/rsvp`).send({ rsvpStatus: 'ACCEPTED' });
+      expect(answer.status).toBeGreaterThanOrEqual(400);
+      await Event.updateMany({}, { $set: { 'rsvp.enabled': true } });
+    });
+
+    // Organizer feedback (screenshot 13): the guest page must show the last date and time to respond
+    it('gives the page the RSVP last date the organizer set, or the event end when none was set', async () => {
+      const lastDate = new Date(Date.now() + 3 * 864e5);
+      await Event.updateMany({}, { $set: { 'rsvp.enabled': true, 'rsvp.acceptanceLastDate': lastDate } });
+      const chosen = await request(app).get(`/api/v1/public/invitations/${rawToken}`);
+      expect(new Date(chosen.body.data.event.rsvp.closesAt).getTime()).toBe(lastDate.getTime());
+
+      await Event.updateMany({}, { $unset: { 'rsvp.acceptanceLastDate': '' } });
+      const fallback = await request(app).get(`/api/v1/public/invitations/${rawToken}`);
+      const event: any = await Event.findOne({}).lean();
+      expect(new Date(fallback.body.data.event.rsvp.closesAt).getTime()).toBe(new Date(event.schedule.end).getTime());
+    });
+
+    it('themes the page after the event\'s invitation design, with safe colour values only', async () => {
+      const res = await request(app).get(`/api/v1/public/invitations/${rawToken}`);
+      const theme = res.body.data.theme;
+      expect(theme.design).toBe('CORPORATE_V2'); // no template chosen: the default design
+      for (const k of ['background', 'primary', 'accent', 'ink']) expect(theme[k]).toMatch(/^#[0-9a-fA-F]{6}$/);
+      expect(['serif', 'sans']).toContain(theme.heading);
+    });
+
+    it('uses the palette of a custom (AI) template, and ignores a malformed one', async () => {
+      const { Template } = await import('../src/models/Template');
+      const spec = { palette: { background: '#101820', primary: '#FEE715', accent: '#00A6A6', text: '#FFFFFF' }, elements: [{ type: 'text', role: 'title', fontFamily: 'Playfair Display' }] };
+      const tpl = await Template.create({ name: 'Custom', cardDesign: 'CUSTOM', designSpec: spec });
+      await Event.updateMany({}, { $set: { templateId: tpl._id } });
+      let res = await request(app).get(`/api/v1/public/invitations/${rawToken}`);
+      expect(res.body.data.theme).toMatchObject({ design: 'CUSTOM', primary: '#FEE715', accent: '#00A6A6', heading: 'serif' });
+
+      await Template.updateOne({ _id: tpl._id }, { $set: { 'designSpec.palette.primary': 'url(javascript:alert(1))' } });
+      res = await request(app).get(`/api/v1/public/invitations/${rawToken}`);
+      for (const k of ['background', 'primary', 'accent', 'ink']) expect(res.body.data.theme[k]).toMatch(/^#[0-9a-fA-F]{6}$/);
+      expect(JSON.stringify(res.body.data.theme)).not.toContain('javascript');
+    });
+
+    it('lets the web app (another origin) display the access card image', async () => {
+      const res = await request(app).get(`/api/v1/public/invitations/${rawToken}/card`);
+      expect(res.status).toBe(200);
+      expect(res.headers['content-type']).toContain('image/png');
+      expect(res.headers['cross-origin-resource-policy']).toBe('cross-origin');
+    });
+
+    it('should return 404 for invalid or unknown token', async () => {
+      const invalidToken = generateSecureToken();
+      const res = await request(app).get(`/api/v1/public/invitations/${invalidToken}`);
+
+      expect(res.statusCode).toBe(404);
+      expect(res.body.success).toBe(false);
+      expect(res.body.message).toBe('Invitation not found or token is invalid');
+    });
+  });
+
+  describe('POST /api/v1/public/invitations/:token/rsvp', () => {
+    it('should successfully submit ACCEPTED RSVP', async () => {
+      const res = await request(app)
+        .post(`/api/v1/public/invitations/${rawToken}/rsvp`)
+        .send({ rsvpStatus: 'ACCEPTED', dietaryPreference: 'Vegan' });
+
+      expect(res.statusCode).toBe(200);
+      expect(res.body.success).toBe(true);
+      expect(res.body.data.rsvpStatus).toBe('ACCEPTED');
+      expect(res.body.data.dietaryPreference).toBe('Vegan');
+
+      // Verify DB persistence
+      const updatedInvitee = await Invitee.findById(inviteeId);
+      expect(updatedInvitee?.rsvpStatus).toBe(RsvpStatus.ACCEPTED);
+      expect(updatedInvitee?.dietaryPreference).toBe('Vegan');
+    });
+
+    it('rejects a dietary choice the organizer did not offer', async () => {
+      const res = await request(app)
+        .post(`/api/v1/public/invitations/${rawToken}/rsvp`)
+        .send({ rsvpStatus: 'ACCEPTED', dietaryPreference: 'Fruitarian' });
+      expect(res.statusCode).toBe(400);
+      expect((await Invitee.findById(inviteeId))?.rsvpStatus).toBe(RsvpStatus.PENDING);
+    });
+
+    it('rejects a food preference sent along with a decline, and records no RSVP', async () => {
+      const res = await request(app)
+        .post(`/api/v1/public/invitations/${rawToken}/rsvp`)
+        .send({ rsvpStatus: 'DECLINED', dietaryPreference: 'Vegan' });
+      expect(res.statusCode).toBe(400);
+      expect(res.body.code).toBe('DIETARY_NOT_ALLOWED_WHEN_DECLINED');
+      const unchanged = await Invitee.findById(inviteeId);
+      expect(unchanged?.rsvpStatus).toBe(RsvpStatus.PENDING);
+      expect(unchanged?.dietaryPreference).toBeFalsy();
+    });
+
+    it('should successfully submit DECLINED RSVP', async () => {
+      const res = await request(app)
+        .post(`/api/v1/public/invitations/${rawToken}/rsvp`)
+        .send({ rsvpStatus: 'DECLINED' });
+
+      expect(res.statusCode).toBe(200);
+      expect(res.body.success).toBe(true);
+      expect(res.body.data.rsvpStatus).toBe('DECLINED');
+
+      const updatedInvitee = await Invitee.findById(inviteeId);
+      expect(updatedInvitee?.rsvpStatus).toBe(RsvpStatus.DECLINED);
+    });
+
+    it('should return 400 for invalid RSVP status choice', async () => {
+      const res = await request(app)
+        .post(`/api/v1/public/invitations/${rawToken}/rsvp`)
+        .send({ rsvpStatus: 'MAYBE' });
+
+      expect(res.statusCode).toBe(400);
+      expect(res.body.success).toBe(false);
+      expect(res.body.error).toBe('Validation Error');
+    });
+
+    it('should return 404 when submitting RSVP for unknown token', async () => {
+      const invalidToken = generateSecureToken();
+      const res = await request(app)
+        .post(`/api/v1/public/invitations/${invalidToken}/rsvp`)
+        .send({ rsvpStatus: 'ACCEPTED' });
+
+      expect(res.statusCode).toBe(404);
+      expect(res.body.success).toBe(false);
+    });
+  });
+
+  describe('required food preference', () => {
+    let organizer: any;
+    beforeEach(async () => { await User.deleteMany({}); organizer = await User.create({ fullName: 'Org', email: 'org.answers@example.com', role: Role.ORGANIZER, isActive: true }); });
+    const rsvp = (body: object) => request(app).post(`/api/v1/public/invitations/${rawToken}/rsvp`).send(body);
+    const food = (body: object) => request(app).post(`/api/v1/public/invitations/${rawToken}/food`).send(body);
+
+    it('a guest who accepts must answer the food question', async () => {
+      const res = await rsvp({ rsvpStatus: 'ACCEPTED' });
+      expect(res.statusCode).toBe(400);
+      expect(res.body.code).toBe('DIETARY_REQUIRED');
+      expect((await Invitee.findById(inviteeId))!.rsvpStatus).toBe(RsvpStatus.PENDING);
+    });
+
+    it('an event without RSVP still collects the food choice on the access card, and it is required and checked', async () => {
+      await Event.updateOne({ _id: eventId }, { 'rsvp.enabled': false });
+      expect((await rsvp({ rsvpStatus: 'ACCEPTED', dietaryPreference: 'Veg' })).statusCode).toBe(400);
+      expect((await food({ dietarySelections: [{ title: 'Dietary Preference', value: 'Pizza' }] })).statusCode).toBe(400);
+      expect((await food({})).statusCode).toBe(400);
+      const ok = await food({ dietarySelections: [{ title: 'Dietary Preference', value: 'Veg' }] });
+      expect(ok.statusCode).toBe(200);
+      const stored = await Invitee.findById(inviteeId);
+      expect(stored!.dietaryPreference).toBe('Veg');
+      expect(stored!.rsvpStatus).toBe(RsvpStatus.PENDING);
+      // the guest may change their mind later
+      expect((await food({ dietarySelections: [{ title: 'Dietary Preference', value: 'Vegan' }] })).statusCode).toBe(200);
+      expect((await Invitee.findById(inviteeId))!.dietaryPreference).toBe('Vegan');
+    });
+
+    it('every question the organizer added is asked, each under its own title, and all must be answered', async () => {
+      await Event.updateOne({ _id: eventId }, { 'rsvp.enabled': false, dietaryPreference: { enabled: true, title: 'Meal', options: [{ title: 'Meal', options: ['Veg', 'Non-Veg'] }, { title: 'T-shirt size', options: ['S', 'M', 'L'] }] } });
+      const page = await request(app).get(`/api/v1/public/invitations/${rawToken}`);
+      expect(page.body.data.event.dietaryPreference.options.map((g: any) => g.title)).toEqual(['Meal', 'T-shirt size']);
+      expect((await food({ dietarySelections: [{ title: 'Meal', value: 'Veg' }] })).body.code).toBe('DIETARY_REQUIRED');
+      const ok = await food({ dietarySelections: [{ title: 'Meal', value: 'Veg' }, { title: 'T-shirt size', value: 'M' }] });
+      expect(ok.statusCode).toBe(200);
+      expect((await Invitee.findById(inviteeId))!.dietarySelections!.map((x: any) => `${x.title}=${x.value}`)).toEqual(['Meal=Veg', 'T-shirt size=M']);
+    });
+
+    it('the organizer\'s invitee list carries each answer under its question, and a changed answer replaces the old one', async () => {
+      const options = [{ title: 'Meal', options: ['Veg', 'Non-Veg'] }, { title: 'Drink', options: ['Coffee', 'Tea'] }];
+      await Event.updateOne({ _id: eventId }, { 'rsvp.enabled': false, dietaryPreference: { enabled: true, title: 'Meal', options } });
+      await Event.updateOne({ _id: eventId }, { organizerId: organizer._id });
+      const answers = async () => (await request(app).get(`/api/v1/events/${eventId}/invitees`).set({ Authorization: `Bearer ${generateAccessToken(String(organizer._id), Role.ORGANIZER)}` })).body.data[0].dietarySelections.map((x: any) => `${x.title}=${x.value}`);
+      await food({ dietarySelections: [{ title: 'Meal', value: 'Non-Veg' }, { title: 'Drink', value: 'Coffee' }] });
+      expect(await answers()).toEqual(['Meal=Non-Veg', 'Drink=Coffee']);
+      await food({ dietarySelections: [{ title: 'Meal', value: 'Veg' }, { title: 'Drink', value: 'Tea' }] });
+      expect(await answers()).toEqual(['Meal=Veg', 'Drink=Tea']);
+    });
+
+    it('the food route is only for events without RSVP, with food enabled, and not cancelled', async () => {
+      const body = { dietarySelections: [{ title: 'Dietary Preference', value: 'Veg' }] };
+      expect((await food(body)).body.code).toBe('RSVP_ENABLED');
+      await Event.updateOne({ _id: eventId }, { 'rsvp.enabled': false, 'dietaryPreference.enabled': false });
+      expect((await food(body)).body.code).toBe('DIETARY_DISABLED');
+      await Event.updateOne({ _id: eventId }, { 'dietaryPreference.enabled': true, status: 'CANCELLED' });
+      expect((await food(body)).statusCode).toBe(410);
+    });
+  });
+});
