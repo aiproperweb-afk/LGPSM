@@ -1,0 +1,390 @@
+"use client";
+
+import React, { useCallback, useEffect, useMemo, useState } from "react";
+import ModalClose from "@/components/common/ModalClose";
+import { inviteeService, type InviteeSetInfo, type InviteeSetMember, type RemovedInviteeList, type RestoreResult, type SetAsideGuest } from "@/services/inviteeService";
+import { formatDateTime } from "@/utils/dateTime";
+import { DELIVERY_LABEL, listDisplayName, restoreErrorMessage, restoreOutcome, stateExplanation } from "@/utils/inviteeLists";
+
+type Tab = "lists" | "aside";
+
+interface Props {
+  eventId: string;
+  initialTab?: Tab;
+  /** Called after guests were restored, so the page can reload its active list */
+  onRestored: () => void;
+  onClose: () => void;
+  /** Opens the add-invitees window (only that window) on top of this one */
+  onAddInvitees?: () => void;
+  /** Changes after guests were added elsewhere, so the lists are fetched again */
+  reloadSignal?: number;
+}
+
+// Shown only once every guest in the list has been sent their invitation: one time when they all went together, otherwise the first and the latest
+const allSentLine = (s: { total: number; sent: number; firstSentAt?: string | null; lastSentAt?: string | null }): string | null => {
+  if (s.total === 0 || s.sent < s.total) return null;
+  if (!s.firstSentAt || !s.lastSentAt) return null;
+  const first = formatDateTime(s.firstSentAt, "");
+  const last = formatDateTime(s.lastSentAt, "");
+  if (!first || !last) return null;
+  return first === last ? first : `${first} – ${last}`;
+};
+const pill = (cls: string, text: string, title?: string, icon?: React.ReactNode) => <span title={title} className={`inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-xs font-medium whitespace-nowrap ${cls}`}>{icon}{text}</span>;
+const PencilIcon = () => <svg className="size-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15.232 5.232l3.536 3.536M4 20h4l10.5-10.5a2.5 2.5 0 00-3.536-3.536L4.5 16.5V20z" /></svg>;
+const BinIcon = () => <svg className="size-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 7h12M9 7V5h6v2m-8 0l1 12h8l1-12" /></svg>;
+const Lock = () => <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 11V8a5 5 0 0110 0v3M6 11h12v9H6z" /></svg>;
+
+// The same shell as the Delivery History dialog: centred modal, title bar with close, table body.
+// A list's Open/Locked state (a property of the list, decided by the server) is kept apart from each guest's delivery state.
+export default function InviteeListsModal({ eventId, initialTab = "lists", onRestored, onClose, onAddInvitees, reloadSignal = 0 }: Props) {
+  const [tab, setTab] = useState<Tab>(initialTab);
+  const [sets, setSets] = useState<InviteeSetInfo[] | null>(null);
+  const [removedLists, setRemovedLists] = useState<RemovedInviteeList[]>([]);
+  // an empty list the organizer is about to delete (asked first)
+  const [dropList, setDropList] = useState<InviteeSetInfo | null>(null);
+  const [dropping, setDropping] = useState(false);
+  // an open list being renamed
+  const [renameList, setRenameList] = useState<InviteeSetInfo | null>(null);
+  const [renameValue, setRenameValue] = useState("");
+  const [renaming, setRenaming] = useState(false);
+  const [setsError, setSetsError] = useState<string | null>(null);
+  const [open, setOpen] = useState<string | null>(null);
+  const [members, setMembers] = useState<Record<string, { rows: InviteeSetMember[]; total: number; page: number } | "loading" | string>>({});
+
+  const [aside, setAside] = useState<{ guests: SetAsideGuest[]; total: number; restorable: boolean; notRestorableReason: string | null } | null>(null);
+  const [asideError, setAsideError] = useState<string | null>(null);
+  const [q, setQ] = useState("");
+  const [picked, setPicked] = useState<string[]>([]);
+  const [confirm, setConfirm] = useState<string[] | null>(null);
+  const [restoring, setRestoring] = useState(false);
+  const [outcome, setOutcome] = useState<{ tone: "success" | "warning" | "error"; message: string; conflicts: string[] } | null>(null);
+
+  const loadSets = useCallback(async () => {
+    setSetsError(null);
+    try {
+      const res = await inviteeService.getInviteeSets(eventId);
+      if (res.success && res.data) { setSets([...res.data.sets, ...(res.data.sessionLists ?? [])]); setRemovedLists(res.data.removedLists ?? []); }
+      else setSetsError(res.message || "The invitee lists could not be loaded.");
+    } catch { setSetsError("The invitee lists could not be loaded. Check your connection and try again."); }
+  }, [eventId]);
+
+  const loadAside = useCallback(async (search: string) => {
+    setAsideError(null);
+    try {
+      const res = await inviteeService.getSetAside(eventId, { q: search });
+      if (res.success && res.data) { setAside(res.data); setPicked((p) => p.filter((id) => res.data!.guests.some((g) => g.id === id))); }
+      else setAsideError(res.message || "The set-aside guests could not be loaded.");
+    } catch { setAsideError("The set-aside guests could not be loaded. Check your connection and try again."); }
+  }, [eventId]);
+
+  useEffect(() => { void Promise.resolve().then(loadSets); }, [loadSets, reloadSignal]);
+  useEffect(() => {
+    if (tab !== "aside") return;
+    const t = setTimeout(() => { void loadAside(q); }, q ? 250 : 0);
+    return () => clearTimeout(t);
+  }, [tab, q, loadAside]);
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape" && !confirm) onClose(); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose, confirm]);
+
+  const toggleSet = async (id: string) => {
+    if (open === id) { setOpen(null); return; }
+    setOpen(id);
+    if (members[id] && members[id] !== "loading" && typeof members[id] !== "string") return;
+    setMembers((m) => ({ ...m, [id]: "loading" }));
+    try {
+      const res = await inviteeService.getSetMembers(eventId, id);
+      setMembers((m) => ({ ...m, [id]: res.success && res.data ? { rows: res.data.members, total: res.data.total, page: res.data.page } : res.message || "The guests of this list could not be loaded." }));
+    } catch { setMembers((m) => ({ ...m, [id]: "The guests of this list could not be loaded." })); }
+  };
+
+  const nameOf = useMemo(() => {
+    const map = new Map((aside?.guests || []).map((g) => [g.id, g.name]));
+    return (id: string) => map.get(id) || "This guest";
+  }, [aside]);
+
+  const doRestore = async () => {
+    if (!confirm) return;
+    setRestoring(true);
+    try {
+      const res = await inviteeService.restoreSetAside(eventId, confirm);
+      if (res.success && res.data) {
+        const r: RestoreResult = res.data;
+        setOutcome(restoreOutcome(r, nameOf));
+        if (r.restored) onRestored();
+      } else setOutcome({ tone: "error", message: restoreErrorMessage(res.message), conflicts: [] });
+    } catch { setOutcome({ tone: "error", message: "The restore request could not reach the server. Nothing was changed.", conflicts: [] }); }
+    setConfirm(null);
+    setPicked([]);
+    setRestoring(false);
+    await Promise.all([loadAside(q), loadSets()]);
+  };
+
+  const doDropList = async () => {
+    if (!dropList) return;
+    setDropping(true);
+    try {
+      const res = await inviteeService.removeList(eventId, dropList.id);
+      setOutcome(res.success
+        ? { tone: "success", message: `“${listDisplayName(dropList.name)}” was deleted. It stays under Deleted lists as history.`, conflicts: [] }
+        : { tone: "error", message: res.message || "The list could not be deleted.", conflicts: [] });
+      if (res.success) onRestored();
+    } catch { setOutcome({ tone: "error", message: "The request could not reach the server. Nothing was changed.", conflicts: [] }); }
+    setDropping(false);
+    setDropList(null);
+    await loadSets();
+  };
+
+  const doRename = async () => {
+    if (!renameList || !renameValue.trim()) return;
+    setRenaming(true);
+    try {
+      const res = await inviteeService.renameList(eventId, renameList.id, renameValue.trim());
+      setOutcome(res.success ? { tone: "success", message: "The list was renamed.", conflicts: [] } : { tone: "error", message: res.message || "The list could not be renamed.", conflicts: [] });
+    } catch { setOutcome({ tone: "error", message: "The request could not reach the server. Nothing was changed.", conflicts: [] }); }
+    setRenaming(false);
+    setRenameList(null);
+    await loadSets();
+  };
+
+  const tabBtn = (id: Tab, label: string, count?: number) => (
+    <button type="button" role="tab" aria-selected={tab === id} onClick={() => setTab(id)} className={`px-4 py-2 text-sm font-medium border-b-2 cursor-pointer ${tab === id ? "border-[#FF651D] text-[#C44200]" : "border-transparent text-[#4B4F52] hover:text-gray-900"}`}>
+      {label}{count !== undefined ? ` (${count})` : ""}
+    </button>
+  );
+  const asideTotal = sets ? sets.reduce((n, s) => n + s.setAside, 0) : undefined;
+
+  return (
+    <div className="fixed inset-0 z-50 bg-black/50 flex items-center justify-center p-4" role="dialog" aria-modal="true" aria-labelledby="lists-title">
+      <div className="bg-white rounded-lg max-w-4xl w-full max-h-[88vh] flex flex-col shadow-2xl">
+        <div className="px-6 py-4 border-b border-[#E5E5E5] flex items-center justify-between">
+          <h2 id="lists-title" className="text-base font-medium text-gray-900">Invitees Dataset</h2>
+          <div className="flex items-center gap-3">
+            {onAddInvitees && (
+              <button type="button" onClick={onAddInvitees} className="px-4 py-2 bg-[#C65318] hover:bg-[#A83800] text-white text-sm font-semibold rounded-md cursor-pointer">Add Invitees</button>
+            )}
+            <button type="button" onClick={onClose} aria-label="Close" className="size-8 flex items-center justify-center rounded-full text-gray-500 hover:bg-gray-100 hover:text-gray-900 cursor-pointer">
+              <svg className="size-5" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
+            </button>
+          </div>
+        </div>
+        <div role="tablist" className="px-6 border-b border-[#E5E5E5] flex gap-2">
+          {tabBtn("lists", "Uploaded lists", sets?.length)}
+          {tabBtn("aside", "Set-aside guests", asideTotal)}
+        </div>
+
+        <div className="p-6 overflow-auto flex-1">
+          {outcome && (
+            <div role="status" className={`mb-4 rounded-md border px-4 py-3 text-sm ${outcome.tone === "success" ? "border-green-200 bg-green-50 text-green-800" : outcome.tone === "warning" ? "border-amber-200 bg-amber-50 text-amber-900" : "border-rose-200 bg-rose-50 text-rose-800"}`}>
+              <p>{outcome.message}</p>
+              {outcome.conflicts.map((c) => <p key={c} className="mt-1">{c}</p>)}
+            </div>
+          )}
+
+          {tab === "lists" && (
+            <>
+              {setsError && <p role="alert" className="text-sm text-rose-600">{setsError} <button type="button" onClick={loadSets} className="underline cursor-pointer">Try again</button></p>}
+              {!sets && !setsError && <p className="text-sm text-[#6B6B6B]">Loading…</p>}
+              {sets && sets.length === 0 && <p className="text-sm text-[#6B6B6B]">No lists yet. Upload an Excel file with Add Invitees.</p>}
+              {sets && sets.length > 0 && (
+                <table className="w-full text-left text-sm min-w-[760px]">
+                  <thead className="text-[#6B6B6B] border-b border-[#D3D3D3]">
+                    <tr>
+                      <th className="py-2 pr-3 font-medium">List</th>
+                      <th className="py-2 pr-3 font-medium">Guests</th>
+                      <th className="py-2 pr-3 font-medium">Delivery of invitations</th>
+                      <th className="py-2 pr-3 font-medium">Set aside</th>
+                      <th className="py-2 pr-3 font-medium">List state</th>
+                      <th className="py-2 font-medium text-right">Action</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-[#EEEEEE] text-[#4B4F52]">
+                    {sets.map((s) => (
+                      <React.Fragment key={s.id}>
+                        <tr className="align-top">
+                          <td className="py-3 pr-3 max-w-[220px]">
+                            <button type="button" onClick={() => toggleSet(s.id)} aria-expanded={open === s.id} className="text-left text-gray-900 font-medium hover:text-[#A83800] cursor-pointer break-words" title={s.name}>{listDisplayName(s.name)}</button>
+                            {s.source === "SESSION" && <span className="block text-xs text-[#6B6B6B]">The guests of this session, taken from the other lists (not an upload)</span>}
+                            {s.createdAt && <span className="block text-xs text-[#6B6B6B]">{s.source === "MANUAL" ? "Added" : "Uploaded"} {formatDateTime(s.createdAt, "")}{s.uploadedBy ? ` · by ${s.uploadedBy.name}` : ""}</span>}
+                            <span className="sm:hidden mt-1 inline-block">{s.locked ? pill("bg-[#EDEDED] text-[#4B4F52]", "Locked") : pill("border border-[#1A9242] text-[#0F7A33] bg-white", "Open")}</span>
+                          </td>
+                          <td className="py-3 pr-3 whitespace-nowrap">{s.total}{s.importedCount !== null ? <span className="block text-xs text-[#6B6B6B]">{s.importedCount} added by this upload</span> : null}</td>
+                          <td className="py-3 pr-3 text-xs space-y-0.5">
+                            {allSentLine(s) && <span className="block mb-1"><span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-[#E6F6EC] text-[#0F7A33] font-medium">Invitations sent</span><span className="block text-[#6B6B6B] mt-0.5">{allSentLine(s)}</span></span>}
+                            <span className="block">Sent <b className="text-[#0F7A33]">{s.sent}</b> · Not sent <b>{s.notSent}</b></span>
+                            <span className="block">Failed <b className={s.failed ? "text-rose-600" : ""}>{s.failed}</b> · Unknown <b className={s.unknown ? "text-amber-700" : ""} title="Delivery was attempted but the outcome was never settled. The guest may have received it.">{s.unknown}</b></span>
+                          </td>
+                          <td className="py-3 pr-3">{s.setAside}</td>
+                          <td className="py-3">
+                            {s.source === "SESSION" ? pill("bg-[#EDEDED] text-[#4B4F52]", "From other lists", "This session uses guests from the lists above, so it has no list of its own to change.") : s.locked ? pill("bg-[#EDEDED] text-[#4B4F52]", "Locked", "Invitations were sent, a guest answered, or a guest checked in. This list is kept as it is.", <Lock />) : pill("border border-[#1A9242] text-[#0F7A33] bg-white", "Open", "No invitation has been sent successfully from this list.")}
+                          </td>
+                          <td className="py-3 text-right">
+                            {(() => {
+                              // an open upload can be renamed or deleted; a locked list, a session's derived list and the hand-added guests cannot
+                              const why = s.source === "SESSION" ? "This session's guests come from the other lists. Change those lists instead." : s.source === "MANUAL" ? "Guests added by hand are not an uploaded list. Edit or delete them from the guest list." : s.locked ? "Locked: invitations were sent from this list, a guest answered, or a guest checked in. It is kept as it is." : "";
+                              const off = "inline-flex size-8 items-center justify-center rounded-md text-gray-300 cursor-not-allowed";
+                              return (
+                                <span className="inline-flex items-center gap-1">
+                                  {why ? (
+                                    <span role="img" aria-label={`Edit list not available: ${why}`} title={why} className={off}><PencilIcon /></span>
+                                  ) : (
+                                    <button type="button" onClick={() => { setOutcome(null); setRenameValue(listDisplayName(s.name)); setRenameList(s); }} aria-label={`Rename ${listDisplayName(s.name)}`} title="Edit list name" className="inline-flex size-8 items-center justify-center rounded-md text-gray-500 hover:bg-gray-100 hover:text-gray-900 cursor-pointer"><PencilIcon /></button>
+                                  )}
+                                  {why ? (
+                                    <span role="img" aria-label={`Delete list not available: ${why}`} title={why} className={off}><BinIcon /></span>
+                                  ) : (
+                                    <button type="button" onClick={() => { setOutcome(null); setDropList(s); }} aria-label={`Delete ${listDisplayName(s.name)}`} title="Delete list" className="inline-flex size-8 items-center justify-center rounded-md text-gray-500 hover:bg-rose-50 hover:text-rose-600 cursor-pointer"><BinIcon /></button>
+                                  )}
+                                </span>
+                              );
+                            })()}
+                          </td>
+                        </tr>
+                        {open === s.id && (
+                          <tr>
+                            <td colSpan={7} className="pb-4">
+                              <div className="rounded-md bg-[#F8F8F8] border border-[#E5E5E5] p-4 text-sm">
+                                <p className="text-[#4B4F52]">{s.source === "SESSION" ? "These are the guests who can attend this session, taken from the lists above. To change them, change the lists they came from." : stateExplanation(s)}</p>
+                                <GuestTable state={members[s.id]} />
+                              </div>
+                            </td>
+                          </tr>
+                        )}
+                      </React.Fragment>
+                    ))}
+                  </tbody>
+                </table>
+              )}
+              {removedLists.length > 0 && (
+                <div className="mt-6">
+                  <h3 className="text-sm font-medium text-gray-900 mb-2">Deleted lists (history)</h3>
+                  <table className="w-full text-left text-xs min-w-[760px]">
+                    <thead className="text-[#6B6B6B] border-b border-[#D3D3D3]"><tr><th className="py-1.5 pr-3 font-medium">List</th><th className="py-1.5 pr-3 font-medium">Uploaded</th><th className="py-1.5 pr-3 font-medium">Added by upload</th><th className="py-1.5 pr-3 font-medium">Set aside</th><th className="py-1.5 font-medium">Deleted</th></tr></thead>
+                    <tbody className="divide-y divide-[#EEEEEE] text-[#4B4F52]">
+                      {removedLists.map((r) => (
+                        <tr key={r.id} className="align-top">
+                          <td className="py-2 pr-3 text-gray-900 break-words" title={r.name}>{listDisplayName(r.name)}</td>
+                          <td className="py-2 pr-3">{r.createdAt ? formatDateTime(r.createdAt, "") : "—"}{r.uploadedBy ? <span className="block text-[#6B6B6B]">by {r.uploadedBy.name}</span> : null}</td>
+                          <td className="py-2 pr-3">{r.importedCount ?? "—"}</td>
+                          <td className="py-2 pr-3">{r.setAside}</td>
+                          <td className="py-2">{formatDateTime(r.removedAt, "")}{r.removedBy ? <span className="block text-[#6B6B6B]">by {r.removedBy.name}</span> : null}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </>
+          )}
+
+          {tab === "aside" && (
+            <>
+              <p className="text-xs text-[#6B6B6B] mb-3">Guests a Replace set aside because they had never been invited. They are kept, apart from your active list, and can be restored.</p>
+              {aside && !aside.restorable && <p role="note" className="mb-3 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-900">{aside.notRestorableReason}</p>}
+              <div className="flex flex-wrap items-center gap-3 mb-3">
+                <input type="search" value={q} onChange={(e) => setQ(e.target.value)} placeholder="Search set-aside guests" aria-label="Search set-aside guests" className="w-64 max-w-full px-3 py-2 bg-[#FAFAFA] border border-[#E0E0E0] rounded-md text-sm focus:outline-none focus:border-black" />
+                <button type="button" disabled={!picked.length || !aside?.restorable} onClick={() => { setOutcome(null); setConfirm(picked); }} className="px-4 py-2 bg-[#C65318] hover:bg-[#A83800] text-white rounded-md text-sm font-medium cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed">Restore selected ({picked.length})</button>
+              </div>
+              {asideError && <p role="alert" className="text-sm text-rose-600">{asideError} <button type="button" onClick={() => loadAside(q)} className="underline cursor-pointer">Try again</button></p>}
+              {!aside && !asideError && <p className="text-sm text-[#6B6B6B]">Loading…</p>}
+              {aside && aside.guests.length === 0 && <p className="text-sm text-[#6B6B6B]">{q ? "No set-aside guest matches your search." : "No guests have been set aside."}</p>}
+              {aside && aside.guests.length > 0 && (
+                <table className="w-full text-left text-sm min-w-[760px]">
+                  <thead className="text-[#6B6B6B] border-b border-[#D3D3D3]">
+                    <tr>
+                      <th className="py-2 pr-2 w-8"><input type="checkbox" aria-label="Select all set-aside guests" disabled={!aside.restorable} checked={picked.length === aside.guests.length} onChange={(e) => setPicked(e.target.checked ? aside.guests.map((g) => g.id) : [])} className="size-4 check-orange" /></th>
+                      <th className="py-2 pr-3 font-medium">Guest</th>
+                      <th className="py-2 pr-3 font-medium">From list</th>
+                      <th className="py-2 pr-3 font-medium">Set aside</th>
+                      <th className="py-2 pr-3 font-medium">Reason</th>
+                      <th className="py-2 font-medium text-right">Action</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-[#EEEEEE] text-[#4B4F52]">
+                    {aside.guests.map((g) => (
+                      <tr key={g.id} className="align-top">
+                        <td className="py-3 pr-2"><input type="checkbox" aria-label={`Select ${g.name}`} disabled={!aside.restorable} checked={picked.includes(g.id)} onChange={() => setPicked((p) => (p.includes(g.id) ? p.filter((x) => x !== g.id) : [...p, g.id]))} className="size-4 check-orange" /></td>
+                        <td className="py-3 pr-3 text-gray-900">{g.name}<span className="block text-xs text-[#6B6B6B] break-all">{g.email || g.mobile || "—"}</span></td>
+                        <td className="py-3 pr-3 max-w-[180px] break-words">{g.fromSet.name}</td>
+                        <td className="py-3 pr-3 text-xs whitespace-nowrap">{formatDateTime(g.setAsideAt, "—")}{g.setAsideBy ? <span className="block text-[#6B6B6B]">by {g.setAsideBy.name}</span> : null}</td>
+                        <td className="py-3 pr-3 text-xs">{g.reasonText || "Reason not recorded"}{g.replacedBy ? <span className="block text-[#6B6B6B]">by “{listDisplayName(g.replacedBy.name)}”</span> : null}</td>
+                        <td className="py-3 text-right"><button type="button" disabled={!aside.restorable} onClick={() => { setOutcome(null); setConfirm([g.id]); }} aria-label={`Restore ${g.name}`} className="px-3 py-1.5 border border-[#FF651D] text-[#C44200] hover:bg-[#D6F5E1] hover:text-[#0F7A33] rounded-md text-xs font-medium cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed">Restore</button></td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
+            </>
+          )}
+        </div>
+      </div>
+
+      {renameList && (
+        <div className="fixed inset-0 z-[60] bg-black/40 flex items-center justify-center p-4" role="dialog" aria-modal="true" aria-labelledby="rename-title">
+          <div className="bg-white rounded-lg max-w-md w-full p-6 shadow-2xl space-y-4 relative">
+            <ModalClose onClick={() => setRenameList(null)} disabled={renaming} />
+            <h3 id="rename-title" className="pr-8 text-base font-semibold text-gray-900">Edit list name</h3>
+            <input value={renameValue} onChange={(e) => setRenameValue(e.target.value)} maxLength={200} aria-label="List name" className="w-full px-3.5 py-2.5 text-sm border border-[#E0E0E0] rounded-md bg-[#FAFAFA] focus:outline-none focus:border-black" />
+            <div className="flex justify-end gap-3">
+              <button type="button" onClick={() => setRenameList(null)} disabled={renaming} className="px-4 py-2 bg-gray-100 hover:bg-gray-200 text-gray-700 rounded-md text-sm font-medium cursor-pointer disabled:opacity-60">Cancel</button>
+              <button type="button" onClick={doRename} disabled={renaming || !renameValue.trim()} className="px-4 py-2 bg-[#C65318] hover:bg-[#A83800] text-white rounded-md text-sm font-medium cursor-pointer disabled:opacity-60">{renaming ? "Saving…" : "Save"}</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {dropList && (
+        <div className="fixed inset-0 z-[60] bg-black/40 flex items-center justify-center p-4" role="alertdialog" aria-modal="true" aria-labelledby="drop-title">
+          <div className="bg-white rounded-lg max-w-md w-full p-6 shadow-2xl space-y-4 overflow-y-auto max-h-[calc(100dvh-2rem)] relative">
+            <ModalClose onClick={() => setDropList(null)} disabled={dropping} />
+            <h3 id="drop-title" className="pr-8 text-base font-semibold text-gray-900">Delete “{listDisplayName(dropList.name)}”?</h3>
+            <p className="text-sm text-[#4B4F52]">Do you want to delete this set of list? {dropList.total > 0 ? `Its ${dropList.total} ${dropList.total === 1 ? "guest has" : "guests have"} not been contacted and will be deleted with it. ` : "It has no guests left. "}The list is removed from Uploaded lists, and its history (when it was uploaded, by whom, and any set-aside guests) stays under Deleted lists.</p>
+            <div className="flex justify-end gap-3">
+              <button type="button" onClick={() => setDropList(null)} disabled={dropping} className="px-4 py-2 bg-gray-100 hover:bg-gray-200 text-gray-700 rounded-md text-sm font-medium cursor-pointer disabled:opacity-60">No, keep it</button>
+              <button type="button" onClick={doDropList} disabled={dropping} className="px-4 py-2 bg-[#C65318] hover:bg-[#A83800] text-white rounded-md text-sm font-medium cursor-pointer disabled:opacity-60">{dropping ? "Deleting…" : "Yes, delete"}</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {confirm && (
+        <div className="fixed inset-0 z-[60] bg-black/40 flex items-center justify-center p-4" role="alertdialog" aria-modal="true" aria-labelledby="restore-title">
+          <div className="bg-white rounded-lg max-w-md w-full p-6 shadow-2xl space-y-4 overflow-y-auto max-h-[calc(100dvh-2rem)] relative">
+            <ModalClose onClick={() => setConfirm(null)} disabled={restoring} />
+            <h3 id="restore-title" className="pr-8 text-base font-semibold text-gray-900">Restore {confirm.length === 1 ? nameOf(confirm[0]) : `${confirm.length} guests`}?</h3>
+            <p className="text-sm text-[#4B4F52]">{confirm.length === 1 ? "This guest returns" : "These guests return"} to the active list as <b>Not sent</b>, in the list {confirm.length === 1 ? "they" : "they each"} came from. No invitation will be sent and no access pass will be created. Anyone whose email or mobile number is already on the active list will not be restored.</p>
+            <div className="flex justify-end gap-3">
+              <button type="button" onClick={doRestore} disabled={restoring} className="px-4 py-2 bg-[#C65318] hover:bg-[#A83800] text-white rounded-md text-sm font-medium cursor-pointer disabled:opacity-60">{restoring ? "Restoring…" : "Restore"}</button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function GuestTable({ state }: { state: { rows: InviteeSetMember[]; total: number; page: number } | "loading" | string | undefined }) {
+  if (!state || state === "loading") return <p className="mt-3 text-[#6B6B6B]">Loading guests…</p>;
+  if (typeof state === "string") return <p role="alert" className="mt-3 text-rose-600">{state}</p>;
+  if (state.rows.length === 0) return <p className="mt-3 text-[#6B6B6B]">No active guests in this list.</p>;
+  return (
+    <div className="mt-3 overflow-x-auto">
+      <table className="w-full text-left text-xs min-w-[520px]">
+        <thead className="text-[#6B6B6B] border-b border-[#D3D3D3]"><tr><th className="py-1.5 pr-3 font-medium">Guest</th><th className="py-1.5 pr-3 font-medium">Invitation</th><th className="py-1.5 pr-3 font-medium">RSVP</th><th className="py-1.5 font-medium">Checked in</th></tr></thead>
+        <tbody className="divide-y divide-[#EEEEEE]">
+          {state.rows.map((m) => (
+            <tr key={m.id}>
+              <td className="py-1.5 pr-3 text-gray-900">{m.name}<span className="block text-[#6B6B6B] break-all">{m.email || m.mobile || "—"}</span></td>
+              <td className="py-1.5 pr-3">{m.delivery === "SENT" ? pill("bg-[#C0FFD5] text-[#0F7A33]", DELIVERY_LABEL.SENT) : m.delivery === "FAILED" ? pill("bg-rose-100 text-rose-700", DELIVERY_LABEL.FAILED) : m.delivery === "UNKNOWN" ? pill("bg-amber-100 text-amber-800", DELIVERY_LABEL.UNKNOWN, "The guest may already have received it") : pill("bg-[#EDEDED] text-[#6E6E6E]", DELIVERY_LABEL.NOT_SENT)}</td>
+              <td className="py-1.5 pr-3">{m.rsvpStatus === "PENDING" ? "—" : m.rsvpStatus === "ACCEPTED" ? "Accepted" : "Declined"}</td>
+              <td className="py-1.5">{m.checkedIn ? "Yes" : "—"}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      {state.total > state.rows.length && <p className="mt-2 text-[#6B6B6B]">Showing the first {state.rows.length} of {state.total} guests.</p>}
+    </div>
+  );
+}

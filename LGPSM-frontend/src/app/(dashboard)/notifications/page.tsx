@@ -1,0 +1,265 @@
+"use client";
+
+import PageHeader from "@/components/common/PageHeader";
+import { useLiveRefresh } from "@/hooks/useLiveRefresh";
+import PopupMessage from "@/components/common/PopupMessage";
+import React, { useCallback, useEffect, useState } from "react";
+import NotificationCard, { NotificationCardData } from "@/components/notifications/NotificationCard";
+import {
+  notificationService,
+  notifyNotificationsChanged,
+  NotificationItem as RealNotification,
+} from "@/services/notificationService";
+import { useAlert } from "@/context/AlertContext";
+import { SkeletonRegion, CardSkeleton } from "@/components/common/Skeleton";
+import ModalClose from "@/components/common/ModalClose";
+import { formatDateAndTime, formatDayMonth } from "@/utils/dateTime";
+
+const PAGE_SIZE = 20;
+
+function formatTimestamp(iso: string): string {
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return "";
+  return formatDateAndTime(d);
+}
+
+function timeAgo(iso: string): string {
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return "";
+  const seconds = Math.max(0, Math.round((Date.now() - d.getTime()) / 1000));
+  if (seconds < 60) return "Just now";
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.round(hours / 24);
+  if (days < 7) return `${days}d ago`;
+  return formatDayMonth(d);
+}
+
+function toCard(n: RealNotification): NotificationCardData {
+  return {
+    id: n._id,
+    type: n.type || "System Notice",
+    title: n.title || "Notification",
+    message: n.message || "",
+    timestamp: n.createdAt ? formatTimestamp(n.createdAt) : "",
+    timeAgo: n.createdAt ? timeAgo(n.createdAt) : undefined,
+    unread: !n.isRead,
+  };
+}
+
+export default function NotificationsPage() {
+  const { confirm } = useAlert();
+  const [notifications, setNotifications] = useState<NotificationCardData[]>([]);
+  // Unread total comes from the backend (covers notifications beyond the loaded pages)
+  const [unreadCount, setUnreadCount] = useState<number>(0);
+  const [page, setPage] = useState(1);
+  const [totalPages, setTotalPages] = useState(1);
+  const [loading, setLoading] = useState<boolean>(true);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [errorFeedback, setErrorFeedback] = useState<string | null>(null);
+  const [openId, setOpenId] = useState<string | null>(null);
+  const openItem = notifications.find((n) => n.id === openId) ?? null;
+
+  const loadPage = useCallback(async (targetPage: number) => {
+    const res = await notificationService.getUserNotifications(false, targetPage, PAGE_SIZE);
+    if (!res.success || !Array.isArray(res.data)) {
+      setErrorFeedback(res.message || "Failed to load notifications.");
+      return false;
+    }
+    const cards = res.data.map(toCard);
+    setNotifications((prev) => (targetPage === 1 ? cards : [...prev, ...cards.filter((c) => !prev.some((p) => p.id === c.id))]));
+    setUnreadCount(res.meta?.unreadCount ?? 0);
+    setTotalPages(res.meta?.totalPages || 1);
+    setPage(targetPage);
+    return true;
+  }, []);
+
+  const reload = useCallback(async () => {
+    setLoading(true);
+    setErrorFeedback(null);
+    await loadPage(1);
+    setLoading(false);
+  }, [loadPage]);
+
+  // new notifications appear on their own (only while the first page is open, so reading older ones is never interrupted)
+  useLiveRefresh(() => { if (page === 1) return loadPage(1); }, 30_000);
+
+  useEffect(() => {
+    let cancelled = false;
+    notificationService.getUserNotifications(false, 1, PAGE_SIZE).then((res) => {
+      if (cancelled) return;
+      if (res.success && Array.isArray(res.data)) {
+        setNotifications(res.data.map(toCard));
+        setUnreadCount(res.meta?.unreadCount ?? 0);
+        setTotalPages(res.meta?.totalPages || 1);
+        setPage(1);
+      } else {
+        setErrorFeedback(res.message || "Failed to load notifications.");
+      }
+      setLoading(false);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const handleLoadMore = async () => {
+    setLoadingMore(true);
+    await loadPage(page + 1);
+    setLoadingMore(false);
+  };
+
+  const handleMarkAllRead = async () => {
+    const res = await notificationService.markAllAsRead();
+    if (!res.success) {
+      setErrorFeedback(res.message || "Failed to mark notifications as read.");
+      return;
+    }
+    setNotifications((prev) => prev.map((n) => ({ ...n, unread: false })));
+    setUnreadCount(0);
+    notifyNotificationsChanged();
+  };
+
+  const handleMarkSingleRead = async (id: string) => {
+    const res = await notificationService.markAsRead(id);
+    if (!res.success) {
+      setErrorFeedback(res.message || "Failed to mark notification as read.");
+      return;
+    }
+    // Reflect the persisted backend state
+    const updated = res.data ? toCard(res.data) : null;
+    setNotifications((prev) => prev.map((n) => (n.id === id ? { ...n, unread: updated ? updated.unread : false } : n)));
+    setUnreadCount((c) => Math.max(0, c - 1));
+    notifyNotificationsChanged();
+  };
+
+  const handleOpen = (id: string) => {
+    setOpenId(id);
+    if (notifications.find((n) => n.id === id)?.unread) void handleMarkSingleRead(id);
+  };
+
+  const handleClearSingleNotification = async (id: string) => {
+    setOpenId((cur) => (cur === id ? null : cur));
+    const res = await notificationService.deleteNotification(id);
+    if (!res.success) {
+      setErrorFeedback(res.message || "Failed to clear notification.");
+      return;
+    }
+    const removed = notifications.find((n) => n.id === id);
+    setNotifications((prev) => prev.filter((n) => n.id !== id));
+    if (removed?.unread) setUnreadCount((c) => Math.max(0, c - 1));
+    notifyNotificationsChanged();
+  };
+
+  const handleClearAllNotifications = async () => {
+    if (notifications.length === 0) return;
+    if (!(await confirm({ title: "Clear all notifications?", message: "Every notification will be removed.", confirmText: "Clear all", tone: "danger" }))) return;
+    const res = await notificationService.clearAllNotifications();
+    if (!res.success) {
+      setErrorFeedback(res.message || "Failed to clear all notifications.");
+      return;
+    }
+    setNotifications([]);
+    setUnreadCount(0);
+    setTotalPages(1);
+    notifyNotificationsChanged();
+  };
+
+  return (
+    <div className="w-full min-h-full bg-white font-sans text-gray-900">
+      {/* Header */}
+      <PageHeader title="Notification" />
+
+      {/* Content */}
+      <div className="px-4 sm:px-6 pt-[35px] w-full space-y-4 pb-24">
+        {notifications.length > 0 && (
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <p className="text-xs text-gray-500">
+              {unreadCount > 0 ? `${unreadCount} unread notification${unreadCount === 1 ? "" : "s"}` : "You're all caught up."}
+            </p>
+            <div className="flex items-center gap-3">
+              {unreadCount > 0 && (
+                <button
+                  type="button"
+                  onClick={handleMarkAllRead}
+                  className="text-xs font-semibold text-gray-600 hover:text-gray-900 transition-colors cursor-pointer"
+                >
+                  Mark all as read
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={handleClearAllNotifications}
+                className="inline-flex items-center gap-1.5 px-3.5 py-1.5 bg-red-50 hover:bg-red-100 text-red-700 border border-red-200 text-xs font-semibold rounded-md transition-colors cursor-pointer"
+              >
+                <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                </svg>
+                <span>Clear all</span>
+              </button>
+            </div>
+          </div>
+        )}
+
+        <PopupMessage message={errorFeedback} action={{ label: "Try again", onClick: reload }} onClose={() => setErrorFeedback(null)} />
+
+        {loading ? (
+          <SkeletonRegion label="Loading notifications" className="space-y-3">
+            {Array.from({ length: 4 }).map((_, i) => <CardSkeleton key={i} lines={2} />)}
+          </SkeletonRegion>
+        ) : notifications.length > 0 ? (
+          <div className="space-y-3">
+            {notifications.map((item) => (
+              <NotificationCard
+                key={item.id}
+                notification={item}
+                onClear={handleClearSingleNotification}
+                onMarkRead={handleMarkSingleRead}
+                onOpen={handleOpen}
+              />
+            ))}
+            {page < totalPages && (
+              <div className="pt-2 flex justify-center">
+                <button
+                  type="button"
+                  onClick={handleLoadMore}
+                  disabled={loadingMore}
+                  className="px-4 py-2 border border-gray-200 hover:bg-gray-50 text-xs font-semibold text-gray-700 rounded-md cursor-pointer disabled:opacity-60"
+                >
+                  {loadingMore ? "Loading..." : "Load older notifications"}
+                </button>
+              </div>
+            )}
+          </div>
+        ) : !errorFeedback ? (
+          <div className="py-20 text-center text-gray-500 text-xs border border-gray-200 rounded-lg bg-gray-50/50 flex flex-col items-center justify-center space-y-3">
+            <div className="w-12 h-12 rounded-full bg-gray-100 flex items-center justify-center text-gray-500">
+              <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.8} d="M15 17h5l-1.405-1.405A2.032 2.032 0 0118 14.158V11a6.002 6.002 0 00-4-5.659V5a2 2 0 10-4 0v.341C7.67 6.165 6 8.388 6 11v3.159c0 .538-.214 1.055-.595 1.436L4 17h5m6 0v1a3 3 0 11-6 0v-1m6 0H9" />
+              </svg>
+            </div>
+            <p className="font-medium text-gray-600">No notifications yet.</p>
+            <p className="text-[11px] text-gray-500">You&apos;re all caught up.</p>
+          </div>
+        ) : null}
+      </div>
+
+      {openItem && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4" onClick={() => setOpenId(null)}>
+          <div role="dialog" aria-modal="true" aria-label={openItem.title} className="relative w-full max-w-md rounded-xl bg-white p-6" onClick={(e) => e.stopPropagation()}>
+            <ModalClose onClick={() => setOpenId(null)} />
+            <h2 className="pr-8 text-base font-semibold text-[#15191C] break-words">{openItem.title}</h2>
+            {openItem.timestamp && <p className="mt-1 text-xs text-[#6B7280]">{openItem.timestamp}</p>}
+            <div className="mt-4 max-h-[50vh] overflow-y-auto text-sm text-[#4B4F52] leading-relaxed whitespace-pre-wrap break-words">{openItem.message}</div>
+            <div className="mt-6 flex justify-end gap-3">
+              <button type="button" onClick={() => handleClearSingleNotification(openItem.id)} className="px-4 py-2 rounded-md border border-red-200 bg-red-50 hover:bg-red-100 text-red-700 text-xs font-semibold cursor-pointer">Delete</button>
+              <button type="button" onClick={() => setOpenId(null)} className="px-4 py-2 rounded-md bg-[#15191C] hover:bg-black text-white text-xs font-semibold cursor-pointer">Close</button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}

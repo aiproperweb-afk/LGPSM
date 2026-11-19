@@ -1,0 +1,760 @@
+"use client";
+
+import AlertIcon from "@/components/common/AlertIcon";
+import { isEventOver } from "@/utils/eventUtils";
+import PopupMessage from "@/components/common/PopupMessage";
+import ClosedEventNotice from "@/components/events/ClosedEventNotice";
+import React, { useState, useEffect, useRef } from "react";
+import { createPortal } from "react-dom";
+import Link from "next/link";
+import { useParams } from "next/navigation";
+import { useAuth } from "@/context/AuthContext";
+import { useLiveRefresh } from "@/hooks/useLiveRefresh";
+import { sessionService } from "@/services/sessionService";
+import { userService } from "@/services/userService";
+import { assignmentService, AssignmentData } from "@/services/assignmentService";
+import { eventService } from "@/services/eventService";
+import EventSubNav, { notifyDbUpdate } from "@/components/EventSubNav";
+import SessionScopePicker from "@/components/common/SessionScopePicker";
+import PageHeader from "@/components/common/PageHeader";
+import { getAssignedCountText, SystemUserRow, filterSystemUsers, USERS_ON_EVENT, ALL_SYSTEM_USERS } from "@/utils/systemUserRows";
+import { useAlert } from "@/context/AlertContext";
+import { TableSkeleton } from "@/components/common/Skeleton";
+import CustomDropdown from "@/components/common/CustomDropdown";
+import RowMenu, { EditIcon, TrashIcon } from "@/components/common/RowMenu";
+import Icon from "@/components/icons/Icon";
+import Pagination from "@/components/common/Pagination";
+import { paginate } from "@/utils/pagination.mjs";
+import { formatDateTime, formatDate } from "@/utils/dateTime";
+
+export default function EventAssignUsersPage() {
+  const { confirm } = useAlert();
+  const params = useParams();
+  const eventId = (params?.id as string);
+  const { user } = useAuth();
+
+  const [users, setUsers] = useState<SystemUserRow[]>([]);
+  const [sessions, setSessions] = useState<any[]>([]);
+  const [eventTitle, setEventTitle] = useState("");
+  const [eventStatus, setEventStatus] = useState<string | undefined>();
+  const [eventEnd, setEventEnd] = useState<unknown>();
+  const historical = isEventOver({ status: eventStatus, schedule: { end: eventEnd } });
+  const [isLoading, setIsLoading] = useState(true);
+
+  const [selectedUserIds, setSelectedUserIds] = useState<string[]>([]);
+  const [expandedUserIds, setExpandedUserIds] = useState<string[]>([]);
+  const [searchQuery, setSearchQuery] = useState("");
+  // Which staff to list: everyone on this event, the staff of one session, or every system user
+  const [userFilter, setUserFilter] = useState<string>(USERS_ON_EVENT);
+  // (a session that was deleted elsewhere while it was the chosen filter falls back to everyone on the event instead of an empty list)
+  const effectiveFilter = userFilter === USERS_ON_EVENT || userFilter === ALL_SYSTEM_USERS || sessions.some((x: { _id?: string; id?: string }) => (x._id || x.id) === userFilter) ? userFilter : USERS_ON_EVENT;
+  const showAllSystemUsers = effectiveFilter === ALL_SYSTEM_USERS;
+  const [page, setPage] = useState(1);
+  const [errorFeedback, setErrorFeedback] = useState<string | null>(null);
+
+  const [isAssignModalOpen, setIsAssignModalOpen] = useState(false);
+  // Ticks that were there before a row's own "⋯ > Change sessions" borrowed the selection; put back if that is cancelled
+  const [selectionBeforeRowAction, setSelectionBeforeRowAction] = useState<string[] | null>(null);
+  const [isAssignSuccessModalOpen, setIsAssignSuccessModalOpen] = useState(false);
+  // null = all sessions of this event
+  const [sessionScope, setSessionScope] = useState<string[] | null>(null);
+  // staff who are already on another of this organizer's events running at the same time, by user id
+  // Every assignment each person holds on the organizer's OTHER events, with whether it overlaps this event in time. The count,
+  // the expanded list and the "already on … at the same time" note all come from this one source, so they cannot disagree.
+  const [elsewhere, setElsewhere] = useState<Record<string, { eventId: string; title: string; start: string; end: string; sessionIds: string[]; overlaps: boolean }[]>>({});
+  const [submittingAssign, setSubmittingAssign] = useState(false);
+
+  // The skeleton is for the first load of an event; a refresh after an assign/unassign keeps the rows on screen
+  const loadedFor = useRef<string | null>(null);
+  // the overlap lookup that is still running (a submit waits for it, so a warning is never skipped) and its latest result
+  const overlapsPending = useRef<Promise<unknown> | null>(null);
+  const overlapsLatest = useRef<typeof elsewhere>({});
+  // an automatic refresh updates quietly: no skeleton, and a failed request keeps what is on screen without raising an error
+  const quietRef = useRef(false);
+  const fetchAssignmentsAndSessions = async () => {
+    const quiet = quietRef.current;
+    quietRef.current = false;
+    try {
+      if (loadedFor.current !== eventId) setIsLoading(true);
+      if (!quiet) setErrorFeedback(null);
+
+      // These resources are independent; load them together instead of serializing four network round trips.
+      const [sessionsRes, eventRes, usersRes, assignRes] = await Promise.all([
+        sessionService.getSessions(eventId),
+        eventService.getEvent(eventId),
+        userService.getUsers("SYSTEM_USER"),
+        assignmentService.getAssignmentsByEvent(eventId),
+      ]);
+      // The overlap warnings are advisory and need several lookups on the server: they appear when ready, the list does not wait for them
+      overlapsPending.current = assignmentService.getOverlaps(eventId, true).catch(() => null).then((overlapRes) => {
+        const overlapMap: typeof elsewhere = {};
+        (overlapRes && overlapRes.success && Array.isArray(overlapRes.data) ? overlapRes.data : []).forEach((o) => { (overlapMap[o.userId] ||= []).push(o); });
+        overlapsLatest.current = overlapMap;
+        setElsewhere(overlapMap);
+      });
+      const sessionList = Array.isArray(sessionsRes?.data) ? sessionsRes.data : [];
+      setSessions(sessionList);
+      if (eventRes.success && eventRes.data) {
+        setEventTitle(eventRes.data.title || "");
+        setEventStatus((eventRes.data as { status?: string }).status);
+        setEventEnd((eventRes.data as { schedule?: { end?: unknown } }).schedule?.end);
+      }
+
+      // System users only (role === SYSTEM_USER)
+      if (!usersRes.success) throw new Error(usersRes.message || "Failed to load system users.");
+      const rawUsers = Array.isArray(usersRes?.data) ? usersRes.data : [];
+      const systemUsersOnly = rawUsers.filter(u => u.role === "SYSTEM_USER");
+
+      // Assignments for this event
+      if (!assignRes.success) throw new Error(assignRes.message || "Failed to load assignments.");
+      const assignmentsList: AssignmentData[] = Array.isArray(assignRes?.data) ? assignRes.data : [];
+
+      const userAssignmentsMap: Record<string, SystemUserRow["assignments"]> = {};
+
+      assignmentsList.forEach((asn) => {
+        const userId = typeof asn.userId === "object" ? asn.userId?._id : asn.userId;
+        if (!userId) return;
+
+        if (!userAssignmentsMap[userId]) {
+          userAssignmentsMap[userId] = [];
+        }
+
+        const sessItems = (asn.sessionIds || []).map((s: any) => ({
+          id: typeof s === "object" ? s._id : s,
+          name: typeof s === "object" ? (s.name || "Session") : "Session",
+          time: typeof s === "object" && s.schedule?.startTime ? `${s.schedule.startTime}` : undefined,
+        }));
+
+        const eventObj = typeof asn.eventId === "object" ? asn.eventId : null;
+        const eventTitle = eventObj?.title || "Event";
+
+        const assignedByObj = typeof asn.assignedBy === "object" ? asn.assignedBy : null;
+        const assignedByName = assignedByObj?.fullName || assignedByObj?.email || "Organizer";
+
+        userAssignmentsMap[userId].push({
+          assignmentId: asn._id,
+          eventId: eventId,
+          eventName: eventTitle,
+          assignedBy: assignedByName,
+          assignedAt: asn.createdAt ? formatDate(asn.createdAt) : undefined,
+          sessions: sessItems,
+        });
+      });
+
+      const formattedUserRows: SystemUserRow[] = systemUsersOnly.map((u: any) => ({
+        id: u._id || u.id,
+        name: u.fullName || u.name || "System User",
+        email: u.email || "",
+        phone: u.phone || u.contactNo || "--",
+        role: u.role,
+        createdAt: u.createdAt,
+        assignments: userAssignmentsMap[u._id || u.id] || [],
+      }));
+
+      setUsers(formattedUserRows);
+      loadedFor.current = eventId;
+    } catch (err: any) {
+      console.error("Error fetching event system user assignments:", err);
+      if (!quiet) setErrorFeedback(err.message || "Failed to load system user assignments.");
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    if (eventId) {
+      fetchAssignmentsAndSessions();
+    }
+  }, [eventId]);
+
+  // a refresh can remove someone who was ticked (their account was switched off elsewhere): they are no longer selected
+  // eslint-disable-next-line react-hooks/set-state-in-effect -- prunes the ticks after a refresh brought a new list
+  useEffect(() => { setSelectedUserIds((ids) => { const kept = ids.filter((id) => users.some((u) => u.id === id)); return kept.length === ids.length ? ids : kept; }); }, [users]);
+
+  // who is on the event, their sessions, and the sessions themselves follow changes made elsewhere (another screen or device, a session
+  // deleted, a staff account switched off); never while the assign window is open or a change is being saved
+  useLiveRefresh(() => {
+    if (isAssignModalOpen || isAssignSuccessModalOpen || submittingAssign) return;
+    quietRef.current = true;
+    return fetchAssignmentsAndSessions();
+  }, 30_000, !!eventId);
+
+  // Someone already on this event is not assigned a second time: choosing them again changes which sessions they cover
+  const selectedRows = users.filter((u) => selectedUserIds.includes(u.id));
+  const alreadyOnEvent = selectedRows.filter((u) => u.assignments.some((a) => a.eventId === eventId)).length;
+  const allAlreadyOnEvent = selectedRows.length > 0 && alreadyOnEvent === selectedRows.length;
+
+  // Opening the popup starts from the selected user's current sessions (or "All sessions")
+  const openAssignModal = () => {
+    setErrorFeedback(null);
+    const only = selectedUserIds.length === 1 ? users.find((u) => u.id === selectedUserIds[0]) : undefined;
+    const current = only?.assignments.find((a) => a.eventId === eventId);
+    setSessionScope(current && current.sessions.length > 0 ? current.sessions.map((s) => s.id) : null);
+    setSelectionBeforeRowAction(null); // the bottom button works on the ticks as they are
+    setIsAssignModalOpen(true);
+  };
+
+  const toggleExpand = (id: string) => {
+    if (expandedUserIds.includes(id)) {
+      setExpandedUserIds(expandedUserIds.filter((i) => i !== id));
+    } else {
+      setExpandedUserIds([...expandedUserIds, id]);
+    }
+  };
+
+  const toggleSelectUser = (id: string) => {
+    if (selectedUserIds.includes(id)) {
+      setSelectedUserIds(selectedUserIds.filter((i) => i !== id));
+    } else {
+      setSelectedUserIds([...selectedUserIds, id]);
+    }
+  };
+
+  const handleSelectAll = () => {
+    if (selectedUserIds.length === filteredUsers.length) {
+      setSelectedUserIds([]);
+    } else {
+      setSelectedUserIds(filteredUsers.map((u) => u.id));
+    }
+  };
+
+  // The row's "⋯" menu works on that one person: change (or give) their sessions, or take them off this event
+  const closeAssignModal = () => {
+    setIsAssignModalOpen(false);
+    if (selectionBeforeRowAction) setSelectedUserIds(selectionBeforeRowAction);
+    setSelectionBeforeRowAction(null);
+  };
+
+  const openAssignFor = (userId: string) => {
+    const user = users.find((u) => u.id === userId);
+    const current = user?.assignments.find((a) => a.eventId === eventId);
+    setErrorFeedback(null);
+    setSelectionBeforeRowAction(selectedUserIds);
+    setSelectedUserIds([userId]);
+    setSessionScope(current && current.sessions.length > 0 ? current.sessions.map((s) => s.id) : null);
+    setIsAssignModalOpen(true);
+  };
+
+  // Handle unassigning via DELETE /api/v1/assignments/:assignmentId
+  const handleUnassignAssignment = async (assignmentId: string) => {
+    if (!(await confirm({ title: "Remove assignment?", message: "This system user will no longer be assigned to this event.", confirmText: "Remove", tone: "danger" }))) return;
+
+    try {
+      setErrorFeedback(null);
+      const res = await assignmentService.deleteAssignment(assignmentId);
+      if (res.success || (res as any).data?.deleted) {
+        await fetchAssignmentsAndSessions();
+        notifyDbUpdate();
+      } else {
+        setErrorFeedback(res.message || "Failed to unassign system user.");
+      }
+    } catch (err: any) {
+      setErrorFeedback(err.message || "Error unassigning system user.");
+    }
+  };
+
+  // Handle assign submission via POST /api/v1/events/:eventId/assignments
+  const handleAssignSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (selectedUserIds.length === 0) {
+      setErrorFeedback("Please select at least one system user.");
+      return;
+    }
+    if (sessionScope !== null && sessionScope.length === 0) {
+      setErrorFeedback("Select at least one session, or choose \"All sessions\".");
+      return;
+    }
+
+    // Putting someone on two events that run at the same time is allowed, but never by accident
+    await overlapsPending.current;
+    const clashes = selectedUserIds.flatMap((id) => (overlapsLatest.current[id] || []).filter((o) => o.overlaps).map((o) => `${users.find((x) => x.id === id)?.name || "A user"}: "${o.title}" (${formatDateTime(o.start)} – ${formatDateTime(o.end)})`));
+    if (clashes.length > 0 && !(await confirm({ title: "Overlapping events", message: `Already assigned to another event at the same time:\n${clashes.join("\n")}\n\nAssign anyway?`, confirmText: "Assign anyway" }))) return;
+
+    try {
+      setSubmittingAssign(true);
+      setErrorFeedback(null);
+
+      const errors: string[] = [];
+
+      for (const targetUserId of selectedUserIds) {
+        const existing = users
+          .find((u) => u.id === targetUserId)
+          ?.assignments.find((a) => a.eventId === eventId);
+        const res = await assignmentService.saveAssignment(eventId, targetUserId, sessionScope ?? [], existing?.assignmentId);
+
+        if (!res.success) {
+          errors.push(res.message || "Assignment failed.");
+        }
+      }
+
+      if (errors.length > 0) {
+        setErrorFeedback(errors.join(". "));
+      }
+
+      // Only confirm success when at least one assignment was actually saved
+      setIsAssignModalOpen(false);
+      setSelectionBeforeRowAction(null);
+      // Never carry a previous selection or session scope into the next assignment
+      setSelectedUserIds([]);
+      setSessionScope(null);
+      if (errors.length < selectedUserIds.length) {
+        setIsAssignSuccessModalOpen(true);
+      }
+      await fetchAssignmentsAndSessions();
+      notifyDbUpdate();
+    } catch (err: any) {
+      setErrorFeedback(err.message || "Error saving assignment.");
+    } finally {
+      setSubmittingAssign(false);
+    }
+  };
+
+  // Filters & Sorting (the same panel as User Management): activity and sort order, applied together with the search and the list picker
+  type UsersFilters = { status: "ALL" | "ASSIGNED" | "UNASSIGNED"; activity: "UPCOMING" | "PAST" | null; sort: "RECENT" | "MOST_EVENTS" | "MOST_UPCOMING" | "NAME" };
+  const DEFAULT_FILTERS: UsersFilters = { status: "ALL", activity: null, sort: "RECENT" };
+  const [filters, setFilters] = useState<UsersFilters>(DEFAULT_FILTERS);
+  const [draft, setDraft] = useState<UsersFilters>(DEFAULT_FILTERS);
+  const [filtersOpen, setFiltersOpen] = useState(false);
+  const activeFilterCount = (filters.status !== "ALL" ? 1 : 0) + (filters.activity ? 1 : 0) + (filters.sort !== "RECENT" ? 1 : 0);
+  const isUpcoming = (a: SystemUserRow["assignments"][number]) => !!a.eventEnd && new Date(a.eventEnd).getTime() >= Date.now();
+  const upcomingOf = (u: SystemUserRow) => u.assignments.filter(isUpcoming).length;
+  const pastOf = (u: SystemUserRow) => u.assignments.filter((a) => !!a.eventEnd && !isUpcoming(a)).length;
+  // Status is about this event: Assigned = already on it, Unassigned = a system user not on it yet (so every system user is considered)
+  const onThisEvent = (u: SystemUserRow) => u.assignments.some((a) => a.eventId === eventId);
+  const eventUsers = filters.status === "UNASSIGNED"
+    ? filterSystemUsers(users, eventId, ALL_SYSTEM_USERS).filter((u) => !onThisEvent(u))
+    : filterSystemUsers(users, eventId, effectiveFilter).filter((u) => filters.status !== "ASSIGNED" || onThisEvent(u));
+  const filteredUsers = eventUsers.filter((u) => {
+    if (filters.activity === "UPCOMING" && upcomingOf(u) === 0) return false;
+    if (filters.activity === "PAST" && pastOf(u) === 0) return false;
+    return (
+      u.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
+      u.email.toLowerCase().includes(searchQuery.toLowerCase()) ||
+      u.phone.includes(searchQuery)
+    );
+  }).sort((a, b) => {
+    switch (filters.sort) {
+      case "MOST_EVENTS": return b.assignments.length - a.assignments.length;
+      case "MOST_UPCOMING": return upcomingOf(b) - upcomingOf(a);
+      case "NAME": return a.name.localeCompare(b.name);
+      default: return new Date(b.createdAt ?? 0).getTime() - new Date(a.createdAt ?? 0).getTime();
+    }
+  });
+  const option = (label: string, selected: boolean, onPick: () => void) => (
+    <button key={label} type="button" role="radio" aria-checked={selected} onClick={onPick} className="flex w-full items-center gap-3 py-2.5 text-left text-base text-[#15191C] cursor-pointer hover:bg-gray-50 rounded-md">
+      <span className={`size-6 shrink-0 rounded-full border-2 ${selected ? "border-[#1A9242] border-[7px]" : "border-[#C9C9C9]"}`} aria-hidden />
+      {label}
+    </button>
+  );
+
+  const isAllSelected = selectedUserIds.length === filteredUsers.length && filteredUsers.length > 0;
+  // 10 people per page (the old bottom-left "1" was a fixed, inert button)
+  const { current: currentPage, totalPages, rows: pageUsers } = paginate(filteredUsers, page, 10);
+  // Figma 217:19768 shows only the empty state (no select-all row or table headers) when nobody is assigned yet
+  const showEmptyAssigned = !isLoading && users.length > 0 && filteredUsers.length === 0 && effectiveFilter === USERS_ON_EVENT && !searchQuery.trim();
+
+  return (
+    <div className="w-full min-h-full bg-white text-gray-900 font-sans select-none">
+      <PageHeader title={user?.role === "ORGANIZER" ? "Event Management" : "Event"} icon={<svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" /></svg>} />
+
+      {/* Page Content */}
+      <div className="px-4 sm:px-6 pt-[30px] pb-24 w-full space-y-6 relative bg-white">
+        {/* Sub-Navigation Tabs Bar */}
+        <EventSubNav
+          eventId={eventId}
+          activeTab="assign-users"
+          // Users assigned to this event (not to any event), once the list has loaded
+          assignmentsCount={isLoading ? undefined : users.filter((u) => u.assignments.some((a) => a.eventId === eventId)).length}
+          sessionsCount={isLoading ? undefined : sessions.length}
+        />
+
+        <ClosedEventNotice status={eventStatus} endsAt={eventEnd} />
+
+        {/* Error Notification Banner */}
+        <PopupMessage message={errorFeedback} onClose={() => setErrorFeedback(null)} />
+
+        {/* Controls (Figma 217:19779): "System Users" + search, assigned/all filter, Add User. Assigning starts from
+            the selected rows (bottom "Assign N users"), so the separate top "Assign Users" button is gone (organiser feedback). */}
+        <div className="flex flex-col sm:flex-row sm:items-center gap-3 sm:gap-6">
+          <div className="flex flex-1 items-center gap-2.5 min-w-0">
+            <label htmlFor="system-user-search" className="text-[17px] font-medium text-black shrink-0">System Users</label>
+            <div className="relative flex-1 min-w-0">
+              <Icon name="events/search" width={18} height={18} className="absolute left-4 top-1/2 -translate-y-1/2 opacity-60" />
+              <input
+                id="system-user-search"
+                type="search"
+                placeholder="Search system user"
+                value={searchQuery}
+                onChange={(e) => { setSearchQuery(e.target.value); setPage(1); }}
+                className="w-full h-[47px] pl-12 pr-4 bg-[#FAFAFA] border border-[#E0E0E0] rounded-md text-xs font-medium text-gray-900 placeholder:text-[#6B6B6B] focus:outline-none focus:border-black"
+              />
+            </div>
+          </div>
+          <div className="flex items-center gap-3 shrink-0 w-fit">
+            <CustomDropdown
+              variant="plain"
+              ariaLabel="Which system users to show"
+              value={effectiveFilter}
+              onChange={(v) => { setUserFilter(v); setSelectedUserIds([]); setPage(1); }}
+              options={[
+                // with a single session, "All sessions" and that session are the same choice: show its name once
+                ...(sessions.length === 1
+                  ? [{ value: USERS_ON_EVENT, label: sessions[0].name || "Session 1" }]
+                  : [{ value: USERS_ON_EVENT, label: "All sessions" }, ...sessions.map((sess, idx) => ({ value: String(sess._id || sess.id), label: sess.name || `Session ${idx + 1}` }))]),
+                { value: ALL_SYSTEM_USERS, label: "All system users" },
+              ]}
+            />
+            <button
+              type="button"
+              onClick={() => { setDraft(filters); setFiltersOpen(true); }}
+              aria-label={`Filters and sorting${activeFilterCount ? ` (${activeFilterCount} active)` : ""}`}
+              title="Filters & Sorting"
+              className="relative h-[47px] px-3 rounded-md hover:bg-gray-100 cursor-pointer"
+            >
+              <Icon name="events/filter" width={20} height={20} />
+              {activeFilterCount > 0 && <span className="absolute top-1.5 right-1 size-4 rounded-full bg-[#C65318] text-white text-[10px] flex items-center justify-center">{activeFilterCount}</span>}
+            </button>
+            <Link href={`/user-management/add?new=1&event=${eventId}`} className="inline-flex items-center gap-2 px-6 py-[11px] bg-[#C65318] hover:bg-[#A83800] text-white text-base font-semibold rounded-lg">
+              <Icon name="events/add-white" width={24} height={24} />
+              Add User
+            </Link>
+          </div>
+        </div>
+
+        {filtersOpen && typeof document !== "undefined" && createPortal(
+          <div className="fixed inset-0 z-50 flex justify-end" role="dialog" aria-modal="true" aria-labelledby="user-filter-title">
+            <div className="absolute inset-0 bg-black/40" onClick={() => setFiltersOpen(false)} />
+            <div className="relative w-full max-w-[380px] bg-white h-full flex flex-col shadow-2xl">
+              <div className="flex items-center justify-between px-6 pt-6 pb-3">
+                <h2 id="user-filter-title" className="text-xl font-semibold text-[#15191C]">Filters &amp; Sorting</h2>
+                <button type="button" onClick={() => setDraft(DEFAULT_FILTERS)} className="text-sm font-medium text-[#6B6B6B] hover:text-black cursor-pointer">Reset</button>
+              </div>
+              <div className="flex-1 overflow-y-auto px-6 pb-4 space-y-6" role="radiogroup">
+                <section>
+                  <h3 className="text-sm font-medium text-[#4B4F52] mb-1">Users Status</h3>
+                  {option("All users", draft.status === "ALL", () => setDraft((d) => ({ ...d, status: "ALL" })))}
+                  {option("Assigned to this event", draft.status === "ASSIGNED", () => setDraft((d) => ({ ...d, status: "ASSIGNED" })))}
+                  {option("Not assigned to this event", draft.status === "UNASSIGNED", () => setDraft((d) => ({ ...d, status: "UNASSIGNED" })))}
+                </section>
+                <section>
+                  <h3 className="text-sm font-medium text-[#4B4F52] mb-1">User Activity</h3>
+                  {option("Has upcoming events", draft.activity === "UPCOMING", () => setDraft((d) => ({ ...d, activity: d.activity === "UPCOMING" ? null : "UPCOMING" })))}
+                  {option("Has past events", draft.activity === "PAST", () => setDraft((d) => ({ ...d, activity: d.activity === "PAST" ? null : "PAST" })))}
+                </section>
+                <section>
+                  <h3 className="text-sm font-medium text-[#4B4F52] mb-1">Sort By</h3>
+                  {option("Recently added", draft.sort === "RECENT", () => setDraft((d) => ({ ...d, sort: "RECENT" })))}
+                  {option("Most events assigned", draft.sort === "MOST_EVENTS", () => setDraft((d) => ({ ...d, sort: "MOST_EVENTS" })))}
+                  {option("Most upcoming events assigned", draft.sort === "MOST_UPCOMING", () => setDraft((d) => ({ ...d, sort: "MOST_UPCOMING" })))}
+                  {option("User name (A-Z)", draft.sort === "NAME", () => setDraft((d) => ({ ...d, sort: "NAME" })))}
+                </section>
+              </div>
+              <div className="flex gap-3 px-6 py-4 border-t border-[#EEE]">
+                <button type="button" onClick={() => setFiltersOpen(false)} className="flex-1 py-3 rounded-lg border border-[#DDD] text-sm font-semibold text-black hover:bg-gray-50 cursor-pointer">Cancel</button>
+                <button type="button" onClick={() => { setFilters(draft); setSelectedUserIds([]); setPage(1); setFiltersOpen(false); }} className="flex-1 py-3 rounded-lg bg-[#FF651D] hover:bg-[#E5560F] text-sm font-semibold text-white cursor-pointer">Apply</button>
+              </div>
+            </div>
+          </div>,
+          document.body
+        )}
+
+        {/* Select All Row */}
+        <div className={`${showEmptyAssigned ? "hidden" : "flex"} items-center gap-2.5 text-sm text-[#4B4F52] font-medium pt-2 pb-2`}>
+          <input
+            type="checkbox"
+            id="selectAll"
+            checked={isAllSelected}
+            onChange={handleSelectAll}
+            className="rounded border-gray-300 text-[#C44200] focus:ring-black cursor-pointer check-orange"
+          />
+          <label htmlFor="selectAll" className="cursor-pointer">
+            Select All ({selectedUserIds.length} selected)
+          </label>
+        </div>
+
+        {/* Users Table */}
+        <div className="overflow-x-auto">
+          <table className="w-full text-left text-sm whitespace-nowrap">
+            <thead className={showEmptyAssigned ? "hidden" : undefined}>
+              <tr className="border-b border-[#D3D3D3] text-[#6B6B6B] font-medium text-sm">
+                <th className="relative py-3 px-4 w-10"><span className="sr-only">Select</span></th>
+                <th className="py-3 px-4 font-medium">User Name</th>
+                <th className="py-3 px-4 font-medium">Assigned Event Sessions</th>
+                <th className="py-3 px-4 font-medium">Email</th>
+                <th className="py-3 px-4 font-medium">Phone Number</th>
+                <th className="py-3 px-4 text-right font-medium">Action</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-gray-200 text-gray-800">
+              {isLoading ? (
+                <tr>
+                  <td colSpan={6} className="p-0"><TableSkeleton rows={5} cols={5} label="Loading system users" /></td>
+                </tr>
+              ) : filteredUsers.length === 0 ? (
+                <tr>
+                  <td colSpan={6} className="py-12 text-center text-gray-500 text-sm">
+                    {users.length === 0 ? (
+                      // nobody has been added yet: said in the middle of the page; "Add User" carries on into adding one, who is then put on this event
+                      <div className="flex flex-col items-center gap-4 py-16 max-w-[360px] mx-auto whitespace-normal">
+                        <Icon name="events/users-empty" width={80} height={67} />
+                        <p className="text-lg font-medium text-black/60">You have not added any system users yet.</p>
+                        <p className="text-sm text-gray-500">Add one now and they are assigned to this event straight away.</p>
+                        <Link href={`/user-management/add?new=1&event=${eventId}`} className="inline-flex items-center gap-2 px-6 py-[11px] bg-[#C65318] hover:bg-[#A83800] text-white text-base font-semibold rounded-lg">
+                          <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" /></svg>
+                          Add User
+                        </Link>
+                      </div>
+                    ) : effectiveFilter !== USERS_ON_EVENT && effectiveFilter !== ALL_SYSTEM_USERS && !searchQuery.trim() ? (
+                      <span>No system users are assigned to this session yet. <button type="button" onClick={() => setUserFilter(ALL_SYSTEM_USERS)} className="font-semibold text-[#C44200] underline cursor-pointer">Show all system users</button> to assign someone.</span>
+                    ) : effectiveFilter === USERS_ON_EVENT && !searchQuery.trim() ? (
+                      // Figma 217:19798 empty state; "Assign User" lists every system user to pick from
+                      <div className="flex flex-col items-center gap-[26px] py-16 max-w-[344px] mx-auto whitespace-normal">
+                        <Icon name="events/users-empty" width={80} height={67} />
+                        <p className="text-lg font-medium text-black/50">No system users assigned yet. Assign system users to your event now.</p>
+                        <button type="button" onClick={() => setUserFilter(ALL_SYSTEM_USERS)} className="px-6 py-[11px] bg-[#F3F3F3] hover:bg-[#EAEAEA] rounded-lg text-base font-semibold text-[#C44200] cursor-pointer">
+                          Assign User
+                        </button>
+                      </div>
+                    ) : (
+                      "No system users match your search."
+                    )}
+                  </td>
+                </tr>
+              ) : (
+                pageUsers.map((u) => {
+                  const isSelected = selectedUserIds.includes(u.id);
+                  const isExpanded = expandedUserIds.includes(u.id);
+                  const otherEvents = elsewhere[u.id] || [];
+                  // this event's assignment plus every other event the person is on, so the count matches the note below the name
+                  const countText = getAssignedCountText([
+                    ...u.assignments,
+                    ...otherEvents.map((o) => ({ assignmentId: `elsewhere-${o.eventId}`, eventId: o.eventId, eventName: o.title, sessions: o.sessionIds.map((id) => ({ id, name: "" })) })),
+                  ]);
+
+                  return (
+                    <tr key={u.id} className="hover:bg-gray-50/80 transition-colors align-top">
+                      <td className="py-4 px-4">
+                        <input
+                          type="checkbox"
+                          checked={isSelected}
+                          onChange={() => toggleSelectUser(u.id)}
+                          aria-label={`Select ${u.name}`}
+                          className="rounded border-gray-300 text-[#C44200] focus:ring-black cursor-pointer mt-0.5 check-orange"
+                        />
+                      </td>
+
+                      <td className="py-4 px-4 font-medium text-gray-900">
+                        <div>{u.name}</div>
+                        <span className="text-[10px] font-mono text-[#C44200] bg-[#FF5B22]/10 px-1.5 py-0.5 rounded">
+                          SYSTEM_USER
+                        </span>
+                        {otherEvents.filter((o) => o.overlaps).map((o) => (
+                          <p key={o.eventId} className="mt-1.5 text-[11px] leading-snug font-medium text-amber-800 bg-amber-50 border border-amber-200 rounded px-2 py-1 max-w-[260px] whitespace-normal break-words">
+                            Already on &quot;{o.title}&quot; at the same time ({formatDateTime(o.start)} – {formatDateTime(o.end)})
+                          </p>
+                        ))}
+                      </td>
+
+                      {/* Assigned Sessions */}
+                      <td className="py-4 px-4">
+                        <button
+                          type="button"
+                          onClick={() => toggleExpand(u.id)}
+                          className="flex items-center gap-2 font-bold text-gray-800 hover:text-[#A83800] transition-colors cursor-pointer"
+                        >
+                          <svg
+                            className={`w-3.5 h-3.5 text-gray-700 transform transition-transform duration-200 ${
+                              isExpanded ? "rotate-180" : ""
+                            }`}
+                            fill="none"
+                            stroke="currentColor"
+                            viewBox="0 0 24 24"
+                          >
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+                          </svg>
+                          <span>{countText}</span>
+                        </button>
+
+                        {/* Expanded Cards View */}
+                        {isExpanded && u.assignments && u.assignments.length > 0 && (
+                          <div className="mt-3 space-y-3 max-w-sm text-left">
+                            {u.assignments.map((asn) => (
+                              <div
+                                key={asn.assignmentId}
+                                className="bg-white border border-gray-200 rounded-md p-3 space-y-2 whitespace-normal"
+                              >
+                                <div className="flex items-center justify-between gap-2">
+                                  <div className="text-sm font-medium text-[#15191C]">
+                                    {asn.eventName}
+                                  </div>
+                                  <button
+                                    type="button"
+                                    onClick={() => handleUnassignAssignment(asn.assignmentId)}
+                                    className="text-rose-600 underline text-xs font-semibold hover:text-rose-800 cursor-pointer"
+                                  >
+                                    Unassign
+                                  </button>
+                                </div>
+
+                                {asn.assignedBy && (
+                                  <div className="text-[10px] text-gray-500">
+                                    Assigned by: <span className="font-medium text-gray-700">{asn.assignedBy}</span>
+                                    {asn.assignedAt ? ` on ${asn.assignedAt}` : ""}
+                                  </div>
+                                )}
+
+                                <div className="space-y-1.5 pt-1">
+                                  {asn.sessions.length === 0 && (
+                                    <div className="inline-flex items-center bg-[#C65318] text-white px-2.5 py-1 rounded-md text-[10px] font-bold">• {sessions.length === 1 ? sessions[0].name : "All sessions"}</div>
+                                  )}
+                                  {asn.sessions.map((sess) => (
+                                    <div key={sess.id} className="flex items-center gap-2 flex-wrap">
+                                      <div className="inline-flex items-center bg-[#C65318] text-white px-2.5 py-1 rounded-md text-[10px] font-bold tracking-tight uppercase">
+                                        • {sess.name} {sess.time ? `| ${sess.time}` : ""}
+                                      </div>
+                                    </div>
+                                  ))}
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                        {/* The person's assignments on the organizer's other events: read-only here (unassign from that event) */}
+                        {isExpanded && otherEvents.length > 0 && (
+                          <div className="mt-3 space-y-2 max-w-sm text-left">
+                            {otherEvents.map((o) => (
+                              <div key={o.eventId} className="bg-gray-50 border border-gray-200 rounded-md p-3 space-y-1 whitespace-normal">
+                                <div className="flex items-start justify-between gap-2">
+                                  <div className="text-sm font-medium text-[#15191C] break-words min-w-0">{o.title}</div>
+                                  <span className="shrink-0 text-[10px] font-semibold text-gray-600 bg-white border border-gray-200 rounded px-1.5 py-0.5">Other event</span>
+                                </div>
+                                <div className="text-[11px] text-gray-500">{formatDateTime(o.start)} – {formatDateTime(o.end)}</div>
+                                <div className="text-[11px] font-medium text-gray-700">{o.sessionIds.length === 0 ? "All sessions" : `${o.sessionIds.length} ${o.sessionIds.length === 1 ? "session" : "sessions"}`}{o.overlaps ? " · overlaps this event" : ""}</div>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </td>
+
+                      <td className="py-4 px-4 text-gray-600">{u.email}</td>
+                      <td className="py-4 px-4 text-gray-600">{u.phone}</td>
+
+                      <td className="py-4 px-4 text-right">
+                        {(() => {
+                          const onThisEvent = u.assignments.find((a) => a.eventId === eventId);
+                          return (
+                            historical ? null : <RowMenu
+                              label={`Actions for ${u.name}`}
+                              items={[
+                                { label: onThisEvent ? "Change sessions" : "Assign to this event", icon: EditIcon, onClick: () => openAssignFor(u.id) },
+                                ...(onThisEvent ? [{ label: "Remove from this event", icon: TrashIcon, onClick: () => handleUnassignAssignment(onThisEvent.assignmentId) }] : []),
+                              ]}
+                            />
+                          );
+                        })()}
+                      </td>
+                    </tr>
+                  );
+                })
+              )}
+            </tbody>
+          </table>
+        </div>
+
+        {/* Bottom Control Bar */}
+        <div className={`pt-4 flex flex-col sm:flex-row sm:items-center justify-between gap-4 ${selectedUserIds.length > 0 && !historical ? "sticky bottom-0 z-20 bg-white border-t border-[#EEE] py-3 -mx-1 px-1" : ""}`}>
+          <div className="flex items-center gap-1 text-xs">
+            <Pagination page={currentPage} totalPages={totalPages} onChange={setPage} label="System user pages" />
+          </div>
+
+          {/* Nothing ticked, nothing to act on: the button appears once someone is selected */}
+          {selectedUserIds.length > 0 && !historical && (
+            <div className="flex items-center gap-3 shrink-0 self-start sm:order-first">
+              <button
+                type="button"
+                onClick={openAssignModal}
+                className="inline-flex items-center justify-center gap-3 px-8 py-3.5 border-2 border-[#FF5B22] text-[#C44200] hover:bg-[#FF5B22] hover:text-white font-semibold text-lg rounded-lg transition-colors cursor-pointer"
+              >
+                <span>{allAlreadyOnEvent ? `Change sessions for ${selectedUserIds.length} ${selectedUserIds.length === 1 ? "user" : "users"}` : `Assign ${selectedUserIds.length} ${selectedUserIds.length === 1 ? "user" : "users"}`}</span>
+                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M14 5l7 7m0 0l-7 7m7-7H3" />
+                </svg>
+              </button>
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* ── Assign Sessions Modal ── */}
+      {isAssignModalOpen && (
+        <div className="fixed inset-0 z-50 bg-black/60 flex items-center justify-center p-4 animate-overlay">
+          <div className="bg-white rounded-lg shadow-2xl max-w-[486px] w-full overflow-y-auto animate-modal max-h-[calc(100dvh-2rem)]">
+            <div className="px-6 py-5 border-b border-[#E0E0E0] flex items-center justify-between">
+              <h3 className="text-base font-medium text-[#15191C]">{allAlreadyOnEvent ? "Change Sessions for Selected System Users" : "Assign Sessions to Selected System Users"}</h3>
+              <button
+                type="button"
+                onClick={closeAssignModal}
+                className="text-gray-500 hover:text-gray-600 cursor-pointer"
+              >
+                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                </svg>
+              </button>
+            </div>
+
+            <form onSubmit={handleAssignSubmit} className="px-6 pt-5 space-y-5">
+              {alreadyOnEvent > 0 && (
+                <p className="p-3 rounded-md bg-[#FFF3EC] border border-[#FFE3D7] text-xs text-[#4B4F52]">
+                  {allAlreadyOnEvent
+                    ? `${selectedRows.length === 1 ? "This user is" : "These users are"} already assigned to this event, so nothing is added twice. Pick the sessions ${selectedRows.length === 1 ? "they" : "they each"} should cover; this replaces the current choice.`
+                    : `${alreadyOnEvent} of the ${selectedRows.length} selected ${alreadyOnEvent === 1 ? "is" : "are"} already assigned to this event. Their sessions are replaced by what you pick here; the others are newly assigned.`}
+                </p>
+              )}
+              <div>
+                <label htmlFor="assign-event" className="block text-xs font-medium text-[#15191C] mb-1.5">Event</label>
+                <select id="assign-event" disabled aria-readonly value={eventId} className="w-full h-[46px] px-3.5 bg-[#F4F4F4] border border-[#E0E0E0] rounded-md text-sm text-[#4B4F52] cursor-not-allowed appearance-none">
+                  <option value={eventId}>{eventTitle || "This event"}</option>
+                </select>
+              </div>
+              <SessionScopePicker
+                sessions={sessions.map((sess, idx) => ({ id: String(sess._id || sess.id), name: sess.name || `Session ${idx + 1}` }))}
+                value={sessionScope}
+                onChange={setSessionScope}
+              />
+
+              <PopupMessage message={errorFeedback} />
+
+              <div className="-mx-6 mt-6 px-6 py-4 border-t border-[#E0E0E0] flex items-center justify-end gap-3">
+                <button
+                  type="submit"
+                  disabled={submittingAssign}
+                  className="px-6 py-[11px] bg-[#C65318] hover:bg-[#A83800] text-white text-base font-semibold rounded-lg transition-colors cursor-pointer disabled:opacity-50"
+                >
+                  {submittingAssign ? "Saving..." : allAlreadyOnEvent ? "Save" : "Assign"}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* Success Modal */}
+      {isAssignSuccessModalOpen && (
+        <div className="fixed inset-0 z-50 bg-black/60 flex items-center justify-center p-4 animate-overlay">
+          <div className="bg-white rounded-md border border-gray-200 shadow-2xl max-w-sm w-full p-8 text-center space-y-6 animate-modal overflow-y-auto max-h-[calc(100dvh-2rem)]">
+            <AlertIcon kind="success" />
+
+            <h3 className="text-lg font-bold text-gray-900">Assigned Successfully!</h3>
+
+            <button
+              onClick={() => setIsAssignSuccessModalOpen(false)}
+              className="w-full py-2.5 bg-[#C65318] hover:bg-[#A83800] text-white font-bold text-xs rounded-md transition-colors cursor-pointer"
+            >
+              Okay
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}

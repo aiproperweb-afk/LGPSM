@@ -1,0 +1,85 @@
+"use client";
+
+import React from "react";
+
+export interface NotificationCardData {
+  id: string;
+  type: string;
+  title: string;
+  message: string;
+  timestamp: string;
+  timeAgo?: string;
+  // Mirrors the backend `isRead` flag (unread === !isRead)
+  unread?: boolean;
+}
+
+interface NotificationCardProps {
+  notification: NotificationCardData;
+  onClear?: (id: string) => void;
+  onMarkRead?: (id: string) => void;
+  onOpen?: (id: string) => void;
+}
+
+export default function NotificationCard({ notification, onClear, onMarkRead, onOpen }: NotificationCardProps) {
+  const unread = !!notification.unread;
+
+  // Opening shows the whole message in a window (the page does that and marks an unread one as read)
+  const handleOpen = () => onOpen?.(notification.id);
+
+  const [day, time] = notification.timestamp.split(" | ");
+
+  // Figma notification card (222:34653 / 2092:1257): bordered panel, 16px title, grey 12px body, "date | time".
+  // Unread cards stay white with a dot; read ones take the design's grey fill. Mark read and clear stay available.
+  return (
+    <div
+      onClick={handleOpen}
+      role="button"
+      tabIndex={0}
+      onKeyDown={(e) => { if (e.key === "Enter" && e.target === e.currentTarget) handleOpen(); }}
+      aria-label={`Open notification: ${notification.title}`}
+      className={`rounded-md border border-[#E0E0E0] px-5 pt-[22px] pb-5 flex gap-4 focus:outline-none focus-visible:ring-2 focus-visible:ring-black/40 ${
+        `cursor-pointer hover:bg-[#EEF3FF] ${unread ? "bg-white" : "bg-[#F8F8F8]"}`
+      }`}
+    >
+      <div className="flex-1 min-w-0">
+        <h2 className="flex items-center gap-2 text-base font-medium text-[#15191C] break-words">
+          {unread && <><span aria-hidden className="size-2 rounded-full bg-[#FF651D] shrink-0" /><span className="sr-only">Unread: </span></>}
+          {notification.title}
+        </h2>
+        <p className="mt-3 text-xs text-[#6B6B6B] leading-[1.25] break-words line-clamp-2">{notification.message}</p>
+        {notification.timestamp && (
+          <p className="mt-3 flex items-center gap-1.5 text-xs text-[#6B7280]" title={notification.timeAgo}>
+            <span>{day}</span>
+            {time && <><span aria-hidden className="w-px h-3 bg-[#A0A0A0]" /><span>{time}</span></>}
+          </p>
+        )}
+      </div>
+
+      <div className="flex items-start gap-1 shrink-0">
+        {unread && onMarkRead && (
+          <button
+            type="button"
+            onClick={(e) => { e.stopPropagation(); onMarkRead(notification.id); }}
+            className="text-[11px] font-semibold text-[#C44200] hover:bg-[#EEF3FF] px-2 py-1 rounded cursor-pointer whitespace-nowrap"
+            title="Mark as read"
+          >
+            Mark read
+          </button>
+        )}
+        {onClear && (
+          <button
+            type="button"
+            onClick={(e) => { e.stopPropagation(); onClear(notification.id); }}
+            className="p-1.5 text-gray-500 hover:text-red-700 hover:bg-red-50 rounded-md cursor-pointer"
+            title="Clear notification"
+            aria-label="Clear notification"
+          >
+            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden>
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+            </svg>
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}

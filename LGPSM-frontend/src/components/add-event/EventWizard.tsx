@@ -1,0 +1,650 @@
+"use client";
+
+import AlertIcon from "@/components/common/AlertIcon";
+import { templateColumnsFor } from "@/utils/inviteeTemplate";
+import PopupMessage from "@/components/common/PopupMessage";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { gsap } from "gsap";
+import StepHeader from "./StepHeader";
+import Step1EventDetails, { EventDateField } from "./Step1EventDetails";
+import Step2Settings from "./Step2Settings";
+import Step3Sessions, { SessionInviteeFile } from "./Step3Sessions";
+import MobileCardPreview from "./MobileCardPreview";
+import ChoiceModal from "@/components/common/ChoiceModal";
+import SelectTemplateModal from "./modals/SelectTemplateModal";
+import DateTimePickerModal from "./modals/DateTimePickerModal";
+import ListResetWarningModal from "./modals/ListResetWarningModal";
+import InviteesPreviewModal from "./modals/InviteesPreviewModal";
+import PageHeader from "@/components/common/PageHeader";
+import { useAuth } from "@/context/AuthContext";
+import { useCategories, ExtraCategory } from "@/hooks/useCategories";
+import { EventFeatureSettings, platformSettingsService } from "@/services/platformSettingsService";
+import { templateService } from "@/services/templateService";
+import { suggestTemplate, SuggestableTemplate } from "@/utils/templateSuggestion";
+import { rowProblem, rowsToSheetFile } from "@/utils/inviteeSheet";
+import { excelColumnsFor, headerFor } from "@/utils/inviteeFields";
+import { inviteeService, type InviteeSetInfo } from "@/services/inviteeService";
+import { CARD_DISPLAY_DEFAULTS, cardDisplayOfDraft, isStaticTemplate, titleLimitOf, DraftErrors, EventDraft, SelectedTemplate, applyEventWindow, stepOfError, validateEventDraft } from "./eventDraft";
+import { DraftStatus } from "@/hooks/useFormDraft";
+import { useAlert } from "@/context/AlertContext";
+import { sessionTimeProblem, sessionsOutsideEvent } from "@/utils/sessionWindow";
+import { formatDateTime } from "@/utils/dateTime";
+
+type PickerTarget =
+  | { kind: "event"; field: EventDateField }
+  | { kind: "session"; key: string; field: "start" | "end" };
+
+export interface EventWizardSubmit {
+  draft: EventDraft;
+  sessionFiles: Record<string, SessionInviteeFile | undefined>;
+}
+
+interface EventWizardProps {
+  heading: string;
+  /** Set when editing a saved event */
+  eventId?: string;
+  /** When the event being edited was created: it cannot start before it, and must end after it */
+  createdAt?: string | null;
+  /** The event's own category, for an account whose list does not include it */
+  extraCategory?: ExtraCategory | null;
+  /** Add Event: whether the saved draft has been read back yet, so the template dialog does not open over a draft that already has one */
+  draftHydrated?: boolean;
+  draft: EventDraft;
+  setDraft: (updater: (prev: EventDraft) => EventDraft) => void;
+  draftStatus: DraftStatus;
+  draftSavedAt: string | null;
+  onDismissDraftStatus: () => void;
+  onDiscardDraft: () => void;
+  canDiscard: boolean;
+  submitLabel: string;
+  submitting: boolean;
+  submitError: string | null;
+  onSubmit: (input: EventWizardSubmit) => void;
+  onCancel: () => void;
+  /** Editing is closed (invitations sent, or the event is over): every step is shown as saved, nothing can be changed, the steps can still be walked through */
+  readOnly?: boolean;
+  /** why it is closed (shown above the steps) */
+  readOnlyReason?: string;
+  /** what can still be done (for example assigning users and adding invitees) */
+  readOnlyActions?: React.ReactNode;
+}
+
+// Shared create/edit event wizard. The page owns the draft (and its persistence); the steps are controlled.
+const prefersReducedMotion = () => typeof window !== "undefined" && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+// The dashboard page scrolls inside <main data-page-reveal>, not the window
+const scrollPageTo = (top: number) =>
+  document.querySelector<HTMLElement>("[data-page-reveal]")?.scrollTo({ top, behavior: prefersReducedMotion() ? "auto" : "smooth" });
+
+export default function EventWizard({
+  heading,
+  eventId,
+  createdAt,
+  extraCategory,
+  draftHydrated = true,
+  draft,
+  setDraft,
+  draftStatus,
+  draftSavedAt,
+  onDismissDraftStatus,
+  onDiscardDraft,
+  canDiscard,
+  submitLabel,
+  submitting,
+  submitError,
+  onSubmit,
+  onCancel,
+  readOnly = false,
+  readOnlyReason,
+  readOnlyActions,
+}: EventWizardProps) {
+  const { confirm, showAlert } = useAlert();
+  const { user } = useAuth();
+  const categories = useCategories(extraCategory);
+  const stepContentRef = useRef<HTMLDivElement>(null);
+  const [currentStep, setCurrentStep] = useState(1);
+  const [showErrors, setShowErrors] = useState(false);
+  // Bumped each time a forward move is blocked by validation, so the page can bring the problem into view
+  const [blockedCount, setBlockedCount] = useState(0);
+  const isFirstStepRender = useRef(true);
+  const [features, setFeatures] = useState<EventFeatureSettings | null>(null);
+  const [featuresError, setFeaturesError] = useState<string | null>(null);
+  const [featuresLoading, setFeaturesLoading] = useState(true);
+  const [pickerTarget, setPickerTarget] = useState<PickerTarget | null>(null);
+  // a session time that does not fit the event: change the event's dates (step 1) or the session's own times (step 3)
+  const [timeConflict, setTimeConflict] = useState<{ title: string; message: string; eventStep: number; target: PickerTarget | null } | null>(null);
+  const [isTemplateModalOpen, setIsTemplateModalOpen] = useState(false);
+  // Set while "Customize Information" is open: the payload the card preview was rendering
+  // The columns of the Excel sample when it was last downloaded here: changing a custom title afterwards earns a warning
+  const [downloadedColumns, setDownloadedColumns] = useState<string[] | null>(null);
+  // "Additional Information" changed after the Excel sample was downloaded: the change waits here until the organizer confirms
+  const [pendingCardInfo, setPendingCardInfo] = useState<EventDraft["cardInfo"] | null>(null);
+  const [resetBusy, setResetBusy] = useState(false);
+  const [resetError, setResetError] = useState<string | null>(null);
+  // Editing: invitee lists the event already has
+  const [existingLists, setExistingLists] = useState<InviteeSetInfo[]>([]);
+  useEffect(() => {
+    if (!eventId) return;
+    let live = true;
+    inviteeService.getInviteeSets(eventId).then((res) => { if (live && res.success && res.data) setExistingLists(res.data.sets.filter((x) => x.total > 0)); }).catch(() => {});
+    return () => { live = false; };
+  }, [eventId]);
+  const [sessionFiles, setSessionFiles] = useState<Record<string, SessionInviteeFile | undefined>>({});
+  const [previewKey, setPreviewKey] = useState<string | null>(null);
+
+  // Options the admin switched off are hidden from the form (the backend also enforces them)
+  const loadFeatures = useCallback(async () => {
+    setFeaturesLoading(true);
+    setFeaturesError(null);
+    try {
+      const res = await platformSettingsService.getEventFeatures();
+      if (!res.success || !res.data) throw new Error(res.message || "Could not load event settings.");
+      setFeatures(res.data);
+    } catch (error) {
+      setFeaturesError(error instanceof Error ? error.message : "Could not load event settings.");
+    } finally {
+      setFeaturesLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadFeatures();
+  }, [loadFeatures]);
+
+  useEffect(() => {
+    if (stepContentRef.current) {
+      // (clearProps: a transform left on this container would make every popup inside it position itself against the container, not the screen)
+      gsap.fromTo(stepContentRef.current, { opacity: 0, x: 20 }, { opacity: 1, x: 0, duration: 0.35, ease: "power2.out", clearProps: "transform,opacity" });
+    }
+  }, [currentStep]);
+
+  // The page scrolls inside the dashboard's <main>, so a step change would otherwise leave the user at the
+  // old scroll position (the bottom of the previous step) instead of the top of the new one.
+  useEffect(() => {
+    if (isFirstStepRender.current) {
+      isFirstStepRender.current = false;
+      return;
+    }
+    scrollPageTo(0);
+  }, [currentStep]);
+
+  // When "Next" is refused, the warning banner and the invalid fields can be far above the button the user just
+  // pressed. Scroll to the first invalid field (or the top of the page when none is on screen yet).
+  useEffect(() => {
+    if (blockedCount === 0) return;
+    const invalid = stepContentRef.current?.querySelector<HTMLElement>('[aria-invalid="true"]');
+    if (invalid) {
+      invalid.scrollIntoView({ block: "center", behavior: prefersReducedMotion() ? "auto" : "smooth" });
+      invalid.focus({ preventScroll: true });
+    } else {
+      scrollPageTo(0);
+    }
+  }, [blockedCount]);
+
+  // the same field definition the Excel sample, the preview and the manual Add Invitee form use
+  const inviteeConfig = templateColumnsFor({ cardInfo: draft.cardInfo, dietaryEnabled: draft.dietaryEnabled, corporate: /corporate/i.test(categories.categoryName(draft.categoryId) || "") });
+  const subcategoryRequired = !!draft.categoryId && categories.subcategoryOptionsFor(draft.categoryId).length > 0;
+  // A restored draft, or a template, can name a category or subcategory that is no longer offered (deleted or deactivated since). The
+  // field would look empty yet count as filled in, so it is cleared and the person is asked to choose again.
+  const listReady = !categories.loading && !categories.error;
+  const categoryGone = listReady && !!draft.categoryId && !categories.categoryOptions.some((o) => o.value === draft.categoryId);
+  const subcategoryGone = listReady && !categoryGone && !!draft.subcategoryId && !categories.subcategoryOptionsFor(draft.categoryId).some((o) => o.value === draft.subcategoryId);
+  useEffect(() => {
+    if (categoryGone) setDraft((prev) => ({ ...prev, categoryId: "", subcategoryId: "" }));
+    else if (subcategoryGone) setDraft((prev) => ({ ...prev, subcategoryId: "" }));
+  }, [categoryGone, subcategoryGone, setDraft]);
+  const isAdmin = user?.role === "ADMIN";
+  const allErrors = useMemo(() => validateEventDraft(draft, { subcategoryRequired, templateRequired: !eventId, isNew: !eventId, createdAt, rsvpOffered: features?.allowEventRSVP === true }), [draft, subcategoryRequired, eventId, features?.allowEventRSVP]);
+  // "I don't have any invitees list yet" unticked means a list is expected: one has to be attached to the first session (or the event already has one)
+  const inviteesMissing = !eventId && !draft.skipInvitees && existingLists.length === 0 && !Object.values(sessionFiles).some(Boolean);
+  const requiredErrors: DraftErrors = inviteesMissing && draft.sessions[0] ? { [`session:${draft.sessions[0].key}:invitees`]: "Add the invitees list, or tick \"I don't have any invitees list yet\" to skip it for later." } : {};
+  const visibleErrors: DraftErrors = showErrors ? { ...allErrors, ...requiredErrors } : {};
+
+  const step1Valid = useMemo(() => !Object.keys(allErrors).some((k) => stepOfError(k) === 1), [allErrors]);
+  const step2Valid = useMemo(() => step1Valid && !Object.keys(allErrors).some((k) => stepOfError(k) === 2), [allErrors, step1Valid]);
+  const maxUnlockedStep = readOnly ? 3 : step2Valid ? 3 : step1Valid ? 2 : 1;
+
+  // Choosing an event type pre-selects the template made for it. Only a template this form chose itself is ever
+  // replaced: once the organizer picks one by hand, their choice stays.
+  const availableTemplates = useRef<SuggestableTemplate[]>([]);
+  const autoTemplateId = useRef<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    templateService.getTemplates().then((res) => {
+      if (!cancelled && res.success && Array.isArray(res.data)) availableTemplates.current = res.data;
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const patch = (p: Partial<EventDraft>) => {
+    let templatePatch: Partial<EventDraft> = {};
+    if (("categoryId" in p || "subcategoryId" in p) && (!draft.template || draft.template.id === autoTemplateId.current)) {
+      const category = "categoryId" in p ? p.categoryId || "" : draft.categoryId;
+      const subcategory = "subcategoryId" in p ? p.subcategoryId || "" : draft.subcategoryId;
+      const suggestion = suggestTemplate(availableTemplates.current, category, subcategory);
+      autoTemplateId.current = suggestion ? suggestion._id : null;
+      templatePatch = { template: suggestion ? { id: suggestion._id, name: suggestion.name, previewKey: suggestion.previewImageKey || null, staticCard: isStaticTemplate((suggestion as { templateData?: { uploaded?: boolean; dynamicDetails?: boolean } }).templateData), titleMaxChars: titleLimitOf((suggestion as { templateData?: { titleMaxChars?: number | null } }).templateData) } : null };
+    }
+    setDraft((prev) => ({ ...prev, ...p, ...templatePatch }));
+  };
+
+  // A new event starts by choosing a template (the dialog cannot be closed until one is chosen); the template then
+  // sets the event category and subcategory. Editing a saved event does not ask again.
+  const [dismissedError, setDismissedError] = useState<string | null>(null);
+  const mustPickTemplate = !readOnly && !eventId && draftHydrated && !draft.template;
+  const chooseTemplate = (template: SelectedTemplate | null, suggested?: { categoryId: string; subcategoryId: string }) => {
+    // an explicit choice is never swapped out by the automatic suggestion that follows a category change
+    autoTemplateId.current = null;
+    setDraft((prev) => ({
+      ...prev,
+      template,
+      // an uploaded design is the whole card: nothing about the card's data is chosen for it
+      ...(template?.staticCard ? { cardInfo: null, cardDisplay: { ...CARD_DISPLAY_DEFAULTS } } : {}),
+      // the template's event type fills the category and subcategory; a general template leaves what is there
+      ...(suggested?.categoryId
+        ? {
+            categoryId: suggested.categoryId,
+            // a category with a single subcategory has it selected for them
+            subcategoryId: suggested.subcategoryId || (categories.subcategoryOptionsFor(suggested.categoryId).length === 1 ? categories.subcategoryOptionsFor(suggested.categoryId)[0].value : ""),
+          }
+        : {}),
+    }));
+  };
+
+  // Invitee files cannot be kept in a saved draft: after a restore, name the ones that have to be attached again (none, no mention)
+  const missingFiles = Object.entries(draft.inviteeFileNames || {}).filter(([key, name]) => !!name && !sessionFiles[key]).map(([, name]) => name);
+
+  const handleStepChange = (targetStep: number) => {
+    if (targetStep === currentStep) return;
+    // nothing is being entered, so there is nothing to check: the steps are simply walked through
+    if (readOnly) { setCurrentStep(targetStep); return; }
+
+    // Moving backward is always allowed
+    if (targetStep < currentStep) {
+      setCurrentStep(targetStep);
+      return;
+    }
+
+    // Moving forward (targetStep > currentStep): Check all prior steps
+    const blockingKeys = Object.keys(allErrors).filter((k) => stepOfError(k) < targetStep);
+
+    if (blockingKeys.length > 0) {
+      setShowErrors(true);
+      setBlockedCount((n) => n + 1);
+      const earliestStepWithErrors = Math.min(...blockingKeys.map(stepOfError));
+      setCurrentStep(earliestStepWithErrors);
+      return;
+    }
+
+    setCurrentStep(targetStep);
+  };
+
+  const handleFinish = () => {
+    const keys = [...Object.keys(allErrors), ...Object.keys(requiredErrors)];
+    if (keys.length > 0) {
+      setShowErrors(true);
+      setCurrentStep(Math.min(...keys.map(stepOfError)));
+      return;
+    }
+    onSubmit({ draft, sessionFiles });
+  };
+
+  const discard = async () => {
+    const confirmed = await confirm({
+      title: "Discard this draft?",
+      message: "The information you entered will be lost.",
+      confirmText: "Discard",
+      cancelText: "Keep editing",
+      tone: "danger",
+      icon: "discard",
+    });
+    if (!confirmed) return;
+    setSessionFiles({});
+    setShowErrors(false);
+    setCurrentStep(1);
+    onDiscardDraft();
+  };
+
+  const pickerValue = (() => {
+    if (!pickerTarget) return null;
+    if (pickerTarget.kind === "event") return (draft[pickerTarget.field] || draft.start) as string | null;
+    const session = draft.sessions.find((s) => s.key === pickerTarget.key);
+    return session ? session[pickerTarget.field] : null;
+  })();
+
+  const pickerTitle = (() => {
+    if (!pickerTarget) return undefined;
+    if (pickerTarget.kind === "event") {
+      return { start: "Event start", end: "Event end", rsvpDeadline: "RSVP last date" }[pickerTarget.field];
+    }
+    const session = draft.sessions.find((s) => s.key === pickerTarget.key);
+    return `${session?.name || "Session"} ${pickerTarget.field === "start" ? "start" : "end"}`;
+  })();
+
+  // Writes the picked instant to exactly the field that opened the picker
+  const handlePickerSave = (iso: string) => {
+    const target = pickerTarget;
+    if (!target) return;
+    if (target.kind === "event") {
+      if (target.field === "rsvpDeadline") patch({ rsvpDeadline: iso });
+      // choosing the start sets the end to the same time the next day; the end can still be changed afterwards
+      else {
+        const windowPatch = target.field === "start" ? { start: iso, end: new Date(new Date(iso).getTime() + 24 * 60 * 60 * 1000).toISOString() } : { [target.field]: iso };
+        const next = applyEventWindow(draft, windowPatch);
+        setDraft(() => next);
+        // sessions with their own times can be left outside the new dates: tell the organizer which ones
+        const outside = sessionsOutsideEvent(next.sessions, next.start, next.end);
+        if (outside.length) setTimeConflict({ title: "Check your session times", message: `${outside.map((s) => `"${s.name || "Untitled session"}"`).join(", ")} ${outside.length === 1 ? "now falls" : "now fall"} outside the event's dates. Open the Sessions step and set ${outside.length === 1 ? "its" : "their"} start and end times within the event (${formatDateTime(next.start, "")} to ${formatDateTime(next.end, "")}). Do you want to change the event time or the session time?`, eventStep: 1, target: null });
+      }
+      return;
+    }
+    // a session has to fall within its event: say so right away instead of accepting a time that cannot be saved
+    const session = draft.sessions.find((s) => s.key === target.key);
+    const problem = sessionTimeProblem({ field: target.field, value: iso, start: session?.start, end: session?.end, eventStart: draft.start, eventEnd: draft.end });
+    if (problem) {
+      // either the session's time or the event's dates can be changed to fix it
+      setTimeConflict({ title: "Session time is outside the event", message: `${problem} Do you want to change the event time or the session time?`, eventStep: 1, target });
+      return;
+    }
+    setDraft((prev) => ({
+      ...prev,
+      sessions: prev.sessions.map((s) => (s.key === target.key ? { ...s, [target.field]: iso, timesLinked: false } : s)),
+    }));
+  };
+
+  // The invitee lists were filled in from the Excel sample: changing the card's guest details afterwards means they no longer fit
+  const listsBuiltFromSample = !!draft.sampleDownloaded || !!downloadedColumns || existingLists.length > 0 || Object.values(sessionFiles).some(Boolean);
+  const step2Change = (p: Partial<EventDraft>) => {
+    if (p.cardInfo !== undefined && listsBuiltFromSample && JSON.stringify(p.cardInfo) !== JSON.stringify(draft.cardInfo)) {
+      setResetError(null);
+      setPendingCardInfo(p.cardInfo);
+      return;
+    }
+    patch(p);
+  };
+  const confirmListReset = async () => {
+    if (pendingCardInfo === null) return;
+    // an event being edited already has its lists on the server: they are deleted first (refused once anything was sent)
+    if (eventId && existingLists.length > 0) {
+      setResetBusy(true);
+      const res = await inviteeService.clearUnusedLists(eventId);
+      setResetBusy(false);
+      if (!res.success) { setResetError(res.message || "The invitee lists could not be deleted."); return; }
+      setExistingLists([]);
+    }
+    setSessionFiles({});
+    setDownloadedColumns(null);
+    setDraft((prev) => ({ ...prev, cardInfo: pendingCardInfo, inviteeFileNames: {}, sampleDownloaded: false }));
+    setPendingCardInfo(null);
+  };
+
+  // one stable object per choice, so the card preview is only redrawn when a tick actually changes
+  const cd = cardDisplayOfDraft(draft);
+  const cardDisplay = useMemo(() => ({ title: cd.title, qr: cd.qr, dateTime: cd.dateTime, location: cd.location, inviteeName: cd.inviteeName, logo: cd.logo }), [cd.title, cd.qr, cd.dateTime, cd.location, cd.inviteeName, cd.logo]);
+
+  const previewSession = previewKey ? draft.sessions.find((s) => s.key === previewKey) : undefined;
+  const previewFile = previewKey ? sessionFiles[previewKey] : undefined;
+
+  const currentStepHasErrors = showErrors && Object.keys(allErrors).some((k) => stepOfError(k) === currentStep);
+  // what is actually wrong on this step, in the words shown under each field (the popup used to say only "complete all required details")
+  const stepProblems = (() => {
+    const seen = new Set<string>();
+    return Object.entries({ ...allErrors, ...requiredErrors })
+      .filter(([key]) => stepOfError(key) === currentStep)
+      .map(([, message]) => String(message ?? "").trim())
+      .filter((message) => message && !seen.has(message) && !!seen.add(message));
+  })();
+  const stepProblemMessage = stepProblems.length === 0
+    ? `Please complete all required details on Step ${currentStep} before proceeding to the next step.`
+    : stepProblems.length === 1
+      ? stepProblems[0]
+      : `Please fix these on Step ${currentStep} before continuing:\n${stepProblems.slice(0, 6).map((m) => `• ${m}`).join("\n")}${stepProblems.length > 6 ? `\n…and ${stepProblems.length - 6} more` : ""}`;
+
+  return (
+    <div className="w-full flex-1 flex flex-col bg-white">
+      <PageHeader title={heading} />
+
+      {draftStatus === "restored" && (
+        <div className="fixed inset-0 z-[10000] flex items-center justify-center bg-black/60 p-4" role="dialog" aria-modal="true" aria-labelledby="restored-draft-title" aria-describedby="restored-draft-description">
+          <div className="w-full max-w-lg overflow-hidden rounded-xl border border-gray-100 bg-white shadow-2xl">
+            <div className="px-6 pt-7 pb-6 text-center sm:px-8">
+              <AlertIcon kind="draft" className="w-14 h-14 mx-auto mb-4" />
+              <h2 id="restored-draft-title" className="text-xl font-semibold text-[#15191C]">Your unsaved event draft was restored</h2>
+              <p id="restored-draft-description" className="mt-3 text-sm leading-6 text-[#4B4F52]">
+                This draft was saved temporarily.<br />
+                Would you like to continue editing it or discard it and start fresh?
+              </p>
+              {missingFiles.length > 0 && (
+                <p className="mt-3 rounded-md bg-amber-50 px-3 py-2 text-sm text-amber-800">
+                  {missingFiles.length === 1
+                    ? <>The invitee file &ldquo;{missingFiles[0]}&rdquo; needs to be attached again.</>
+                    : <>These invitee files need to be attached again: {missingFiles.map((name) => `“${name}”`).join(", ")}.</>}
+                </p>
+              )}
+            </div>
+            <div className="grid place-items-center border-t border-[#E0E0E0] bg-gray-50 px-6 py-4 sm:px-8">
+              <div className="mx-auto flex w-fit flex-col-reverse items-center gap-3 sm:flex-row">
+                {canDiscard && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setSessionFiles({});
+                      setShowErrors(false);
+                      setCurrentStep(1);
+                      onDiscardDraft();
+                    }}
+                    className="rounded-lg border border-rose-200 bg-white px-5 py-3 text-sm font-semibold text-rose-700 hover:bg-rose-50 cursor-pointer focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-rose-600"
+                  >
+                    Discard draft
+                  </button>
+                )}
+                <button
+                  type="button"
+                  autoFocus
+                  onClick={onDismissDraftStatus}
+                  className="rounded-lg bg-[#FF651D] px-5 py-3 text-sm font-semibold text-white hover:bg-[#E5520F] cursor-pointer focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#FF651D]"
+                >
+                  {canDiscard ? "Keep draft and continue" : "Continue"}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Problems are shown as popups, not banners */}
+      <PopupMessage message={currentStepHasErrors ? stepProblemMessage : null} type="warning" title={stepProblems.length === 1 ? "Please check this" : `Please check Step ${currentStep}`} onClose={() => setShowErrors(false)} />
+      <PopupMessage message={draftStatus === "discarded-stale" ? "An older unsaved draft was discarded because this event was changed since it was saved." : null} type="info" title="Draft discarded" onClose={onDismissDraftStatus} />
+      <PopupMessage message={submitError && submitError !== dismissedError ? `${submitError} Your entries are kept, so you can fix the problem and try again.` : null} title="The event could not be saved" onClose={() => setDismissedError(submitError)} />
+      {(draftSavedAt && draftStatus !== "restored") && (
+        <div className="px-4 sm:px-6 pt-4 space-y-2">
+          {(
+            <p className="text-xs text-[#6B6B6B]">
+              Draft saved on this device at {new Date(draftSavedAt).toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit" })}
+              {canDiscard && (
+                <>
+                  {" · "}
+                  <button type="button" onClick={discard} className="underline cursor-pointer hover:text-rose-600">Discard draft</button>
+                </>
+              )}
+            </p>
+          )}
+        </div>
+      )}
+
+      <div className="p-4 sm:p-6 flex-1">
+        {/* overflow-clip (not hidden, which would break the sticky header and preview) trims the white header and the beige
+            preview column to the rounded border, so no square corners poke past it */}
+        <div className="border border-[#E0E0E0] rounded-lg overflow-clip flex flex-col xl:flex-row bg-white">
+          <div className="w-full xl:w-[62%] flex flex-col min-w-0">
+            <StepHeader currentStep={currentStep} onStepClick={handleStepChange} maxUnlockedStep={maxUnlockedStep} />
+            {readOnly && (
+              <div role="status" className="mx-6 mt-5 rounded-md border border-[#FDBA74] bg-[#FFF7ED] px-4 py-3 text-sm text-[#7C2D12]">
+                <p className="font-semibold text-[#9A3412]">Editing is closed</p>
+                <p className="mt-0.5">{readOnlyReason ? `${readOnlyReason} ` : ""}Everything is shown as it was saved. You can look through the three steps, but nothing can be changed.</p>
+              </div>
+            )}
+            {/* closed for editing: a disabled fieldset turns every field in the step off; the few controls that are not form fields are switched off too */}
+            <fieldset disabled={readOnly} className={`min-w-0 border-0 p-0 m-0 flex-1 ${readOnly ? "[&_[role=checkbox]]:pointer-events-none [&_[role=switch]]:pointer-events-none [&_[role=radio]]:pointer-events-none [&_[role=combobox]]:pointer-events-none [&_[role=option]]:pointer-events-none [&_[role=button]]:pointer-events-none" : ""}`}>
+            <div ref={stepContentRef} className="flex-1">
+              {featuresLoading ? (
+                <div className="p-8 text-center text-sm text-[#667085]" role="status">Loading saved event settings…</div>
+              ) : featuresError || !features ? (
+                <div className="p-8 text-center space-y-3" role="alert">
+                  <p className="text-sm text-rose-700">{featuresError || "Event settings are unavailable."} The event form needs the saved platform settings before you can continue.</p>
+                  <button type="button" onClick={() => void loadFeatures()} className="px-4 py-2 border border-[#FF651D] rounded-md text-sm font-medium text-[#C44200]">Retry</button>
+                </div>
+              ) : currentStep === 1 ? (
+                <Step1EventDetails
+                  draft={draft}
+                  onChange={patch}
+                  onOpenDatePicker={(field) => setPickerTarget({ kind: "event", field })}
+                  categories={categories}
+                  canManageCategories={isAdmin}
+                  isAdmin={isAdmin}
+                  isEditing={!!eventId}
+                  rsvpAllowed={features.allowEventRSVP}
+                  errors={visibleErrors}
+                  onNext={() => handleStepChange(2)}
+                  onCancel={onCancel}
+                  readOnly={readOnly}
+                />
+              ) : currentStep === 2 ? (
+                <Step2Settings draft={draft} onChange={step2Change} errors={visibleErrors} features={features} sampleColumnsChanged={!!downloadedColumns && downloadedColumns.join("|") !== excelColumnsFor(inviteeConfig).join("|")} onNext={() => handleStepChange(3)} onBack={() => setCurrentStep(1)} readOnly={readOnly} />
+              ) : (
+                <Step3Sessions
+                  sessions={draft.sessions}
+                  onSessionsChange={(sessions) => patch({ sessions })}
+                  sessionFiles={sessionFiles}
+                  existingLists={existingLists}
+                  onSampleDownloaded={() => { setDownloadedColumns(excelColumnsFor(inviteeConfig)); patch({ sampleDownloaded: true }); }}
+                  onSessionFileChange={(key, file) => {
+                    setSessionFiles((prev) => ({ ...prev, [key]: file || undefined }));
+                    // remembered in the draft so a restore can say exactly which file has to be attached again
+                    setDraft((prev) => {
+                      const names = { ...(prev.inviteeFileNames || {}) };
+                      if (file) names[key] = file.name; else delete names[key];
+                      return { ...prev, inviteeFileNames: names };
+                    });
+                  }}
+                  skipInvitees={draft.skipInvitees}
+                  templateColumns={inviteeConfig}
+                  onSkipInviteesChange={(skipInvitees) => patch({ skipInvitees })}
+                  eventStart={draft.start}
+                  eventEnd={draft.end}
+                  errors={visibleErrors}
+                  onOpenSessionPicker={(key, field) => setPickerTarget({ kind: "session", key, field })}
+                  onOpenInviteesPreview={setPreviewKey}
+                  onFinish={handleFinish}
+                  onBack={() => setCurrentStep(2)}
+                  submitting={submitting}
+                  submitLabel={submitLabel}
+                  readOnly={readOnly}
+                />
+              )}
+            </div>
+            </fieldset>
+            {readOnly && (
+              <div className="px-6 pb-6 pt-2 flex flex-wrap items-center justify-between gap-3 border-t border-[#E5E5E5]">
+                <div className="flex items-center gap-3 pt-4">
+                  {currentStep > 1 ? <button type="button" onClick={() => setCurrentStep(currentStep - 1)} className="px-6 py-2.5 border border-gray-300 hover:bg-gray-50 text-gray-900 text-sm font-medium rounded-md cursor-pointer">Back</button> : <button type="button" onClick={onCancel} className="px-6 py-2.5 border border-gray-300 hover:bg-gray-50 text-gray-900 text-sm font-medium rounded-md cursor-pointer">Back to event</button>}
+                  {currentStep < 3 ? <button type="button" onClick={() => setCurrentStep(currentStep + 1)} className="px-8 py-2.5 bg-[#FF651D] hover:bg-[#E5520F] text-white text-sm font-medium rounded-md cursor-pointer">Next</button> : <button type="button" onClick={onCancel} className="px-8 py-2.5 bg-[#FF651D] hover:bg-[#E5520F] text-white text-sm font-medium rounded-md cursor-pointer">Back to event</button>}
+                </div>
+                {readOnlyActions && <div className="flex items-center gap-3 pt-4">{readOnlyActions}</div>}
+              </div>
+            )}
+          </div>
+          {/* The column runs the full height of the form; only its contents stick, 16px below the 68px sticky page
+              header, so the preview stays in view however long the current step is (admin feedback: sticky preview). It never scrolls itself:
+              the card is sized to fit the space below the header, so the form is the only thing that scrolls. */}
+          <div className="w-full xl:w-[38%] shrink-0 border-t xl:border-t-0 xl:border-l border-[#E0E0E0] bg-[#F7F3F0]">
+            <div className="xl:sticky xl:top-[84px]">
+            <MobileCardPreview
+              template={draft.template}
+              eventTitle={draft.title}
+              eventStart={draft.start}
+              eventEnd={draft.end}
+              venue={draft.venue}
+              contactNumber={draft.contactNumber}
+              logoKey={draft.logoKey}
+              categoryName={categories.categoryName(draft.categoryId)}
+              subcategoryName={categories.subcategoryName(draft.categoryId, draft.subcategoryId)}
+              onOpenTemplateModal={readOnly ? undefined : () => setIsTemplateModalOpen(true)}
+              cardInfo={draft.cardInfo ?? null}
+              cardDisplay={cardDisplay}
+              awaitingTemplate={!eventId && !draft.template}
+            />
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <SelectTemplateModal
+        key={isTemplateModalOpen || mustPickTemplate ? "template-open" : "template-closed"}
+        isOpen={isTemplateModalOpen || mustPickTemplate}
+        required={mustPickTemplate}
+        onClose={() => setIsTemplateModalOpen(false)}
+        onSelectTemplate={chooseTemplate}
+        onLeave={onCancel}
+        extraCategory={extraCategory}
+        organizerId={draft.organizerIds[0]}
+        selectedTemplateId={draft.template?.id}
+        categoryId={draft.categoryId || undefined}
+        subcategoryId={draft.subcategoryId || undefined}
+      />
+
+      {pendingCardInfo !== null && (
+        <ListResetWarningModal busy={resetBusy} error={resetError} onCancel={() => setPendingCardInfo(null)} onConfirm={() => void confirmListReset()} />
+      )}
+
+      {timeConflict && (
+        <ChoiceModal
+          title={timeConflict.title}
+          message={timeConflict.message}
+          onClose={() => setTimeConflict(null)}
+          first={{ label: "Change event time", onClick: () => { setTimeConflict(null); setCurrentStep(1); } }}
+          second={{
+            label: "Change session time",
+            onClick: () => { const t = timeConflict.target; setTimeConflict(null); handleStepChange(3); if (t) setPickerTarget(t); },
+          }}
+        />
+      )}
+      <DateTimePickerModal
+        key={pickerTarget ? `${JSON.stringify(pickerTarget)}-${pickerValue ?? ""}` : "picker-closed"}
+        isOpen={!!pickerTarget}
+        onClose={() => setPickerTarget(null)}
+        onSave={handlePickerSave}
+        value={pickerValue}
+        title={pickerTitle}
+      />
+
+      {previewKey && previewFile && (
+        <InviteesPreviewModal
+          title="Invitee Preview List"
+          subtitle={`${previewSession?.name || "Session"} · ${previewFile.name}`}
+          rows={previewFile.rows}
+          showCompany={!!inviteeConfig.company || previewFile.rows.some((r) => r.company)}
+          identityLabel={inviteeConfig.identityLabel}
+          identity2Label={inviteeConfig.identity2 ? headerFor("identity2", inviteeConfig) : undefined}
+          showIdentity={!!inviteeConfig.identity || previewFile.rows.some((r) => r.identity)}
+          onClose={() => setPreviewKey(null)}
+          onSave={async (rows) => {
+            // Edits replace the uploaded file, so the import receives exactly what was previewed
+            const key = previewKey;
+            const name = sessionFiles[key]?.name;
+            if (!name) return;
+            const file = await rowsToSheetFile(rows, name);
+            setSessionFiles((prev) => {
+              const current = prev[key];
+              if (!current) return prev;
+              return { ...prev, [key]: { ...current, rows, file, problemCount: rows.filter((r) => rowProblem(r)).length } };
+            });
+          }}
+        />
+      )}
+    </div>
+  );
+}

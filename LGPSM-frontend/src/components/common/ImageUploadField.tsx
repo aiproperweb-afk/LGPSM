@@ -1,0 +1,145 @@
+"use client";
+
+import React, { useRef, useState } from "react";
+import PopupMessage from "@/components/common/PopupMessage";
+import Image from "next/image";
+import { ACCEPTED_IMAGE_TYPES, MediaPurpose, mediaService } from "@/services/mediaService";
+import { resolveImageUrl } from "@/utils/mediaUrl";
+import DashedBorder from "@/components/common/DashedBorder";
+import ImageCropModal from "@/components/common/ImageCropModal";
+
+interface ImageUploadFieldProps {
+  // Stored image reference ("media:<id>", URL or site path); empty when there is no image
+  value: string | null;
+  onChange: (key: string | null) => void;
+  purpose: MediaPurpose;
+  label?: React.ReactNode;
+  hint?: string;
+  aspectClassName?: string;
+  /** Stretch to the height of the row it sits in (the box grows instead of keeping its own aspect ratio) */
+  fill?: boolean;
+  /** Extra classes for the empty drop area (e.g. a minimum height) */
+  emptyClassName?: string;
+  disabled?: boolean;
+  optional?: boolean;
+  onUploadingChange?: (uploading: boolean) => void;
+  /** Offer a 1:1 crop before the picture is uploaded */
+  squareCrop?: boolean;
+  /** Offer a crop to a fixed shape (width ÷ height, e.g. 9 / 16) before the picture is uploaded; the shape cannot be changed in the crop window */
+  cropAspect?: { ratio: number; label: string };
+}
+
+// Uploads immediately and previews the stored copy, so what the user sees here is exactly what
+// every other screen renders from the saved key.
+export default function ImageUploadField({
+  value,
+  onChange,
+  purpose,
+  label,
+  hint = "JPG, PNG or WEBP, up to 5 MB",
+  aspectClassName = "aspect-[3/4]",
+  fill = false,
+  emptyClassName = "",
+  disabled = false,
+  optional = false,
+  onUploadingChange,
+  squareCrop = false,
+  cropAspect,
+}: ImageUploadFieldProps) {
+  const [cropping, setCropping] = useState<File | null>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
+  const [uploading, setUploading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [dragOver, setDragOver] = useState(false);
+  const preview = resolveImageUrl(value);
+
+  // a picked picture goes to the crop window first when this field crops; an animated or vector picture is uploaded as it is
+  const pick = (file: File | undefined) => {
+    if (!file || disabled) return;
+    if ((squareCrop || cropAspect) && /^image\/(jpeg|png|webp)$/.test(file.type)) { setCropping(file); if (inputRef.current) inputRef.current.value = ""; return; }
+    void upload(file);
+  };
+
+  const upload = async (file: File | undefined) => {
+    if (!file || disabled) return;
+    setError(null);
+    setUploading(true);
+    onUploadingChange?.(true);
+    const res = await mediaService.uploadImage(file, purpose);
+    setUploading(false);
+    onUploadingChange?.(false);
+    if (inputRef.current) inputRef.current.value = "";
+    if (res.success && res.data?.key) onChange(res.data.key);
+    else setError(res.message || "Upload failed. Please try again.");
+  };
+
+  return (
+    <div className={fill ? "flex h-full flex-col" : undefined}>
+      {label && <div className="block text-sm font-medium text-gray-900 mb-1.5">{label}</div>}
+      <input
+        ref={inputRef}
+        type="file"
+        accept={ACCEPTED_IMAGE_TYPES}
+        className="hidden"
+        disabled={disabled || uploading}
+        onChange={(e) => pick(e.target.files?.[0])}
+      />
+      {preview ? (
+        <div className={`relative w-full ${fill ? "flex-1 min-h-[140px]" : aspectClassName} rounded-md overflow-hidden border border-[#E0E0E0] bg-[#F4F5F8]`}>
+          <Image src={preview} alt="Uploaded image preview" fill unoptimized sizes="400px" className="object-contain" />
+          <div className="absolute bottom-2 left-2 right-2 flex gap-2 justify-center">
+            <button
+              type="button"
+              disabled={disabled || uploading}
+              onClick={() => inputRef.current?.click()}
+              className="px-3 py-1.5 rounded-md bg-white/95 border border-gray-200 text-xs font-medium text-gray-800 hover:bg-white cursor-pointer disabled:opacity-60"
+            >
+              {uploading ? "Uploading..." : "Replace"}
+            </button>
+            <button
+              type="button"
+              disabled={disabled || uploading}
+              onClick={() => onChange(null)}
+              className="px-3 py-1.5 rounded-md bg-white/95 border border-gray-200 text-xs font-medium text-rose-600 hover:bg-white cursor-pointer disabled:opacity-60"
+            >
+              Remove
+            </button>
+          </div>
+        </div>
+      ) : (
+        <button
+          type="button"
+          disabled={disabled || uploading}
+          onClick={() => inputRef.current?.click()}
+          onDragOver={(e) => {
+            e.preventDefault();
+            setDragOver(true);
+          }}
+          onDragLeave={() => setDragOver(false)}
+          onDrop={(e) => {
+            e.preventDefault();
+            setDragOver(false);
+            pick(e.dataTransfer.files?.[0]);
+          }}
+          className={`group relative w-full rounded-md p-6 text-center text-sm transition-colors cursor-pointer disabled:cursor-not-allowed ${
+            fill ? "flex flex-1 flex-col items-center justify-center" : ""
+          } ${emptyClassName} ${
+            dragOver ? "bg-orange-50/50" : "bg-[#FAFAFA]"
+          }`}
+        >
+          <DashedBorder className={dragOver ? "text-[#FF651D]" : optional ? "text-[#D3D3D3] group-focus:text-[#16A34A]" : "text-[#D3D3D3] group-hover:text-[#FF651D]"} />
+          <span className="text-[#4B4F52]">
+            {uploading ? "Uploading..." : (
+              <>
+                Drag and drop an image here or <span className="text-[#E5520F] font-medium underline">click to open file</span>
+              </>
+            )}
+          </span>
+          <span className="block mt-1 text-xs text-[#828282]">{hint}</span>
+        </button>
+      )}
+      {cropping && <ImageCropModal file={cropping} onCancel={() => setCropping(null)} aspect={cropAspect?.ratio} aspectLabel={cropAspect?.label} onConfirm={(cropped) => { setCropping(null); void upload(cropped); }} />}
+      <PopupMessage message={error} />
+    </div>
+  );
+}

@@ -1,0 +1,38 @@
+{
+  "name": "lgpsm",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "eslint",
+    "test": "node --test \"src/**/*.test.mjs\"",
+    "icons": "node scripts/build-icons.mjs"
+  },
+  "dependencies": {
+    "@types/qrcode": "^1.5.6",
+    "gsap": "^3.15.0",
+    "jsqr": "^1.4.0",
+    "leaflet": "^1.9.4",
+    "lenis": "^1.3.26",
+    "lottie-web": "5.13.0",
+    "next": "16.4.6",
+    "qrcode": "^1.5.4",
+    "react": "19.2.8",
+    "react-dom": "19.2.8",
+    "xlsx": "https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4",
+    "@types/leaflet": "^1.9.12",
+    "@types/node": "^20",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "eslint": "^9",
+    "eslint-config-next": "16.4.6",
+    "sass": "^1.104.1",
+    "tailwindcss": "^4",
+    "typescript": "^5"
+  }
+}
