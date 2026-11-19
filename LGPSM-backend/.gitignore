@@ -8,7 +8,7 @@ card-previews/
 backend.log
 .next/
 dist/
-frontend/
+
 
 # Copied from src/assets by the build; the server falls back to src/assets, so this need not be committed
 dist/assets/
